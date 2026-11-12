@@ -49,9 +49,6 @@ Unlike distributed inference projects (like Petals or Exo) that slice a standard
 ## Installation & Quick Start
 
 1. Clone or download `python.py`:
-   ```bash
-   git clone [https://github.com/bb-0-5/p2p-spatial-llm.git](https://github.com/bb-0-5/p2p-spatial-llm.git)
-   cd p2p-spatial-llm
 
  * Run the default benchmark and enter the interactive Termux REPL:
    python python.py
