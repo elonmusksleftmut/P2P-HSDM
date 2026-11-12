@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 """
-python.py (p2p_spatial_llm v4.0)
+python.py (p2p_spatial_llm v5.0)
 ================================
-Complete, zero-dependency P2P Vivaldi-Coordinate Language Model over real UDP
-sockets (127.0.0.1).
-
-Upgrades in v4.0:
-  1. True Vivaldi 3D Network Coordinate Springs: every UDP packet arrival runs
-     an adaptive Vivaldi spring step using measured wire RTT, peer confidence
-     error (vivaldi_err), and 64-trit phase impedance.
-  2. Strict Sender vs. Query-Origin Separation: the 51B header always carries
-     the immediate UDP sender's (pos, vivaldi_err); QUERY_FMT carries the 3D
-     Query Origin (origin_x, origin_y, origin_z) inside the payload so gossip
-     forwarding never corrupts peer coordinate tables.
-  3. Peer-to-Peer Synaptic Gossip & Word Migration (PKT_SYNAPTIC_GOSSIP):
-     co-activating words and 64-trit Hebbian weights migrate across low-RTT
-     Vivaldi neighbors over UDP rather than teleporting nodes via god-view.
-  4. Recurrent 64-Trit Wavefront Memory & Semantic Corpus Routing: full-prompt
-     exponential phase trace + resonant 64-trit shard routing on /load.
+Zero-dependency P2P Vivaldi-Coordinate Language Model over UDP with:
+  1. Fixed Reference Anchors (3D Tetrahedral GPS Landmarks, is_fixed=True) vs.
+     Mobile Surfing/Trilaterating Nodes (is_fixed=False).
+  2. Clock-Skew-Immune Two-Way PING/PONG Wire RTT Measurement (echoes sender's
+     64-bit microsecond timestamp back to compute RTT on a single clock).
+  3. Full IPv4 + Port Multi-Hop Routing (70B QUERY_FMT with 4-byte IPv4 origin)
+     and LAN UDP Broadcast Discovery (SO_BROADCAST on port 9999) for running
+     across multiple Android/Termux phones and desktops on Wi-Fi/Hotspot.
+  4. 64-Trit Ternary Synaptic Micro-Matrix ({-1, 0, +1}^{V x 64}) + Recurrent
+     Phase Wavefront + Unicode Braille 2x4 Sub-Pixel Trajectory Renderer.
 """
 
 import argparse
@@ -30,32 +24,37 @@ import pathlib
 import random
 import re
 import shutil
+import socket
 import struct
 import sys
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
 # ============================================================================
-# 1. BINARY UDP PROTOCOL SPECIFICATION (VIVALDI + 64-TRIT HEADER)
+# 1. BINARY UDP PROTOCOL SPECIFICATION (FIXED/MOBILE FLAGS + IPV4 + PING/PONG)
 # ============================================================================
-MAGIC = b"P4"
+MAGIC = b"P5"
 PKT_QUERY_PULSE     = 0x01
 PKT_TOKEN_PROPOSAL  = 0x02
 PKT_HEBBIAN_REWARD  = 0x03
 PKT_LIVE_INJECT     = 0x04
 PKT_SYNAPTIC_GOSSIP = 0x05
+PKT_PING_BEACON     = 0x06
+PKT_PONG_REPLY      = 0x07
+
+FLAG_FIXED_ANCHOR   = 0x01  # Bit 0 of flags_ttl byte: 1 = Fixed Anchor, 0 = Mobile Node
 
 # Header (51 bytes):
-# magic(2s), pkt_type(B), ttl(B), query_id(I), sender_id(H),
+# magic(2s), pkt_type(B), flags_ttl(B), query_id(I), sender_id(H),
 # domain_id(B), timestamp_us(Q), sender_x(f), sender_y(f), sender_z(f),
 # sender_vivaldi_err(f), packed_trits(16B)
 HEADER_FMT = "!2sBBIHBQffff16B"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
-# QUERY (66 bytes):
-# origin_port(H), spatial_lambda(f), origin_x(f), origin_y(f), origin_z(f),
+# QUERY (70 bytes):
+# origin_ip(4s), origin_port(H), spatial_lambda(f), origin_x(f), origin_y(f), origin_z(f),
 # w_prev2(16s), w_prev1(16s), w_curr(16s)
-QUERY_FMT = "!Hffff16s16s16s"
+QUERY_FMT = "!4sHffff16s16s16s"
 QUERY_SIZE = struct.calcsize(QUERY_FMT)
 
 # PROPOSAL (32 bytes):
@@ -67,6 +66,35 @@ PROPOSAL_SIZE = struct.calcsize(PROPOSAL_FMT)
 # w_prev1(16s), w_curr(16s), winning_word(16s), reward(f)
 REWARD_FMT = "!16s16s16sf"
 REWARD_SIZE = struct.calcsize(REWARD_FMT)
+
+# PING / PONG PAYLOAD (10 bytes):
+# echo_timestamp_us(Q), sender_listen_port(H)
+PING_PONG_FMT = "!QH"
+PING_PONG_SIZE = struct.calcsize(PING_PONG_FMT)
+
+
+def pack_flags_ttl(is_fixed: bool, ttl: int) -> int:
+    clamped_ttl = max(0, min(63, ttl))
+    return (clamped_ttl << 1) | (FLAG_FIXED_ANCHOR if is_fixed else 0)
+
+
+def unpack_flags_ttl(flags_ttl: int) -> Tuple[bool, int]:
+    is_fixed = bool(flags_ttl & FLAG_FIXED_ANCHOR)
+    ttl = (flags_ttl >> 1) & 0x3F
+    return is_fixed, ttl
+
+
+def detect_lan_ipv4() -> str:
+    """Detects the primary non-loopback LAN IPv4 address for Wi-Fi / Hotspot routing."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        ip = s.getsockname()[0]
+    except OSError:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
 
 
 # ============================================================================
@@ -102,13 +130,11 @@ def compute_ternary_64(tokens: List[str], recurrent_trace: Optional[List[float]]
 
 
 def update_recurrent_trace(trace: List[float], new_token: str, decay: float = 0.82) -> List[float]:
-    """Updates the continuous 64-float recurrent context wave with a newly emitted token."""
     tok_trits = compute_ternary_64([new_token])
     return [decay * trace[i] + 0.45 * tok_trits[i] for i in range(TRIT_DIM)]
 
 
 def pack_ternary_64(trits: List[int]) -> Tuple[int, ...]:
-    """Packs 64 trits in {-1, 0, +1} into 16 unsigned bytes (4 trits per byte)."""
     packed = []
     for chunk_idx in range(PACKED_TRIT_BYTES):
         byte_val = 0
@@ -121,7 +147,6 @@ def pack_ternary_64(trits: List[int]) -> Tuple[int, ...]:
 
 
 def unpack_ternary_64(packed_bytes: Tuple[int, ...]) -> List[int]:
-    """Unpacks 16 unsigned bytes back into 64 trits in {-1, 0, +1}."""
     trits = []
     for byte_val in packed_bytes:
         for sub in range(4):
@@ -131,7 +156,6 @@ def unpack_ternary_64(packed_bytes: Tuple[int, ...]) -> List[int]:
 
 
 def ternary_cosine_64(vec_a: List[int], vec_b: List[int]) -> float:
-    """Returns normalized phase alignment in [0.0, 1.0] between two 64-trit vectors."""
     dot = 0
     norm_a = 0
     norm_b = 0
@@ -147,8 +171,6 @@ def ternary_cosine_64(vec_a: List[int], vec_b: List[int]) -> float:
 class TernaryMicroExpert:
     """
     Local ternary {-1, 0, +1}^{V x 64} associative synaptic matrix inside each peer.
-    Maps 64-trit context phase vectors to candidate vocabulary logits using integer
-    dot products and updates weights via clipped Hebbian accumulation.
     """
 
     def __init__(self, deadzone: int = 1, clip_limit: int = 14):
@@ -240,6 +262,12 @@ BRAILLE_DOT_MAP = (
 
 
 class BrailleTopologyRenderer:
+    """
+    Renders a 2D projection of the 3D coordinate space using Unicode Braille
+    sub-pixel graphics. Distinguishes Fixed Reference Anchors (UPPERCASE: P, D, M, C)
+    from Mobile Drifting Nodes (lowercase: p, d, m, c).
+    """
+
     def __init__(self, char_width: int = 56, char_height: int = 15, span: float = 4.6):
         term_cols = shutil.get_terminal_size((78, 24)).columns
         self.w = max(36, min(char_width, term_cols - 6))
@@ -298,11 +326,21 @@ class BrailleTopologyRenderer:
             for i in range(len(trajectory) - 1):
                 p0 = trajectory[i]
                 p1 = trajectory[i + 1]
-                self.draw_subpixel_line(p0[0], p0[1], p0[0] if p0 == p1 else p1[0], p1[1])
+                self.draw_subpixel_line(p0[0], p0[1], p1[0], p1[1])
 
-        for node in nodes:
+        # Draw Mobile nodes first (lowercase), then Fixed Anchors on top (UPPERCASE)
+        mobile_nodes = [n for n in nodes if not n.is_fixed]
+        fixed_nodes = [n for n in nodes if n.is_fixed]
+
+        for node in mobile_nodes:
             c, r = self._to_cell(node.pos[0], node.pos[1])
-            self.char_overlay[(c, r)] = domain_symbols.get(node.domain_id, "*")
+            sym = domain_symbols.get(node.domain_id, "*").lower()
+            self.char_overlay[(c, r)] = sym
+
+        for node in fixed_nodes:
+            c, r = self._to_cell(node.pos[0], node.pos[1])
+            sym = domain_symbols.get(node.domain_id, "*").upper()
+            self.char_overlay[(c, r)] = sym
 
         if trajectory and len(trajectory) >= 2:
             sc, sr = self._to_cell(trajectory[0][0], trajectory[0][1])
@@ -333,13 +371,25 @@ class BrailleTopologyRenderer:
                     row_chars.append("·")
             lines.append("│" + "".join(row_chars) + "│")
         lines.append("└" + "─" * self.w + "┘")
-        lines.append(" Legend: [P] Physics  [D] P2P  [M] ML/Thermo  [C] Control  [o->··->@] Vivaldi Surf Trail")
+        lines.append(
+            " Legend: [P/D/M/C]=Fixed Reference Anchors  [p/d/m/c]=Mobile Nodes  [o->··->@]=Surf Trail"
+        )
         return "\n".join(lines)
 
 
 # ============================================================================
-# 4. DEFAULT DOMAIN CORPORA & FILESYSTEM CORPUS EXTRACTOR
+# 4. FIXED TETRAHEDRAL REFERENCE GEOMETRY & DOMAIN CORPORA
 # ============================================================================
+# Non-coplanar regular tetrahedron vertices inscribed in [-2.6, +2.6]^3.
+# Pairwise distance between any two Fixed Domain Anchors is identical (~7.35 units),
+# providing an non-degenerate 3D GPS trilateration frame for all mobile nodes.
+FIXED_TETRAHEDRAL_ANCHORS: Dict[int, Tuple[float, float, float]] = {
+    0: (+2.60, +2.60, +2.60),  # Physics & Wave Resonance (Anchor P)
+    1: (+2.60, -2.60, -2.60),  # Distributed Consensus & P2P (Anchor D)
+    2: (-2.60, +2.60, -2.60),  # Statistical ML & Thermodynamics (Anchor M)
+    3: (-2.60, -2.60, +2.60),  # Cybernetics & Control Theory (Anchor C)
+}
+
 DOMAIN_NAMES: Dict[int, str] = {
     0: "Physics & Wave Resonance",
     1: "Distributed Consensus & P2P",
@@ -439,7 +489,7 @@ def extract_clean_sentences_from_path(target_path: str) -> List[str]:
 
 
 # ============================================================================
-# 5. P2P SWARM NODE (UDP SOCKET + VIVALDI RTT SPRINGS + 64-TRIT SYNAPSES)
+# 5. P2P SWARM NODE (FIXED REFERENCE ANCHORS vs. MOBILE TRILATERATING NODES)
 # ============================================================================
 class P2PLLMNode(asyncio.DatagramProtocol):
     def __init__(
@@ -449,24 +499,30 @@ class P2PLLMNode(asyncio.DatagramProtocol):
         sentences: List[str],
         initial_pos: Tuple[float, float, float],
         rng: random.Random,
+        is_fixed: bool = False,
+        bind_ip: str = "127.0.0.1",
     ):
         self.node_id = node_id
         self.domain_id = domain_id
         self.rng = rng
+        self.is_fixed = is_fixed
+        self.bind_ip = bind_ip
 
-        # 3D Vivaldi Network Coordinates [x, y, z] and adaptive Vivaldi confidence error
+        # Fixed Reference Anchors have locked coordinates and minimal error (0.01).
+        # Mobile Nodes start with high Vivaldi error (0.85) and trilaterate against Anchors.
         self.pos: List[float] = list(initial_pos)
-        self.vivaldi_err: float = 0.80
+        self.vivaldi_err: float = 0.010 if is_fixed else 0.850
 
         # UDP networking state
         self.transport: Optional[asyncio.DatagramTransport] = None
         self.port: int = 0
-        self.max_peers: int = 16
+        self.max_peers: int = 20
+        # peer_id -> {"ip": str, "port": int, "domain_id": int, "is_fixed": bool, "pos": [x,y,z], "err": float, "rtt_ms": float, "trits": [...]}
         self.peers: Dict[int, Dict[str, object]] = {}
         self.seen_queries: collections.deque = collections.deque(maxlen=512)
         self.seen_gossip: collections.deque = collections.deque(maxlen=512)
 
-        # Spatial Refractory State (Inhibition of Return)
+        # Spatial Refractory State
         self.refractory_energy: float = 1.0
 
         # Local Hybrid Predictor: N-Gram Graph + 64-Trit Ternary Synaptic Matrix
@@ -480,6 +536,13 @@ class P2PLLMNode(asyncio.DatagramProtocol):
 
         for s in sentences:
             self.ingest_sentence(s)
+
+    def set_role(self, is_fixed: bool) -> None:
+        self.is_fixed = is_fixed
+        if is_fixed:
+            self.vivaldi_err = 0.010
+        else:
+            self.vivaldi_err = max(0.25, self.vivaldi_err)
 
     def _recompute_vocab_signature(self, new_trits: List[int]) -> None:
         for i in range(TRIT_DIM):
@@ -513,10 +576,6 @@ class P2PLLMNode(asyncio.DatagramProtocol):
         context_trits: List[int],
         strength: int = 1,
     ) -> None:
-        """
-        Migrates a reinforced word transition and its 64-trit synaptic trace into
-        this node when received from a low-RTT Vivaldi neighbor.
-        """
         if not winning_word:
             return
         self.unigrams[winning_word] += 1
@@ -535,31 +594,43 @@ class P2PLLMNode(asyncio.DatagramProtocol):
         self.transport = transport  # type: ignore
         self.port = transport.get_extra_info("sockname")[1]
 
-    def _synthetic_underlay_rtt_ms(self, peer_id: int, peer_domain: int) -> float:
+    def _effective_rtt_ms(self, peer_id: int, peer_domain: int, peer_ip: str, raw_rtt_ms: float) -> float:
         """
-        Provides a deterministic physical underlay RTT floor on 127.0.0.1 loopback
-        (where OS kernel socket latency is uniform ~0.1ms) while adding real measured
-        socket latency on top. On real multi-host deployments, real wire RTT dominates.
+        If communicating across real physical LAN IPs (e.g. two separate phones on Wi-Fi),
+        uses the real measured Ping/Pong hardware RTT directly. If running on 127.0.0.1
+        loopback where OS kernel transit is uniform, blends a physical underlay latency floor
+        with the measured socket RTT so mobile nodes trilaterate cleanly against Fixed Anchors.
         """
+        if peer_ip != "127.0.0.1" and peer_ip != self.bind_ip:
+            return max(0.10, min(150.0, raw_rtt_ms))
+
         same_rack = (self.domain_id == peer_domain)
         pair_hash = ((self.node_id * 131 + peer_id * 97) ^ (peer_id * 131 + self.node_id * 97)) & 0xFF
-        jitter = (pair_hash / 255.0) * 0.45
+        jitter = (pair_hash / 255.0) * 0.35
         if same_rack:
-            return 0.65 + jitter
-        ring_dist = min((self.domain_id - peer_domain) % 4, (peer_domain - self.domain_id) % 4)
-        return 2.10 + 0.85 * ring_dist + jitter
+            underlay = 0.55 + jitter
+        else:
+            # Tetrahedral cross-domain distance maps to ~4.2ms underlay RTT
+            underlay = 3.85 + jitter
+        return underlay + min(2.0, raw_rtt_ms * 0.25)
 
     def register_peers(self, all_nodes: List["P2PLLMNode"], k_neighbors: int = 12) -> None:
-        candidates = [n for n in all_nodes if n.node_id != self.node_id]
-        sampled = self.rng.sample(candidates, min(k_neighbors, len(candidates)))
-        for peer in sampled:
-            base_rtt = self._synthetic_underlay_rtt_ms(peer.node_id, peer.domain_id)
+        # Ensure every mobile node always registers all Fixed Reference Anchors for trilateration
+        fixed_anchors = [n for n in all_nodes if n.is_fixed and n.node_id != self.node_id]
+        other_candidates = [n for n in all_nodes if not n.is_fixed and n.node_id != self.node_id]
+        sampled_others = self.rng.sample(
+            other_candidates, min(max(2, k_neighbors - len(fixed_anchors)), len(other_candidates))
+        )
+        for peer in fixed_anchors + sampled_others:
+            eff_rtt = self._effective_rtt_ms(peer.node_id, peer.domain_id, peer.bind_ip, 0.5)
             self.peers[peer.node_id] = {
+                "ip": peer.bind_ip,
                 "port": peer.port,
                 "domain_id": peer.domain_id,
+                "is_fixed": peer.is_fixed,
                 "pos": list(peer.pos),
                 "err": peer.vivaldi_err,
-                "rtt_ms": base_rtt,
+                "rtt_ms": eff_rtt,
                 "trits": list(peer.vocab_trit_signature),
             }
 
@@ -568,6 +639,9 @@ class P2PLLMNode(asyncio.DatagramProtocol):
             return 0.0
         return sum(float(p["rtt_ms"]) for p in self.peers.values()) / len(self.peers)
 
+    def anchor_peer_count(self) -> int:
+        return sum(1 for p in self.peers.values() if bool(p.get("is_fixed", False)))
+
     def _pack_header(
         self,
         pkt_type: int,
@@ -575,17 +649,14 @@ class P2PLLMNode(asyncio.DatagramProtocol):
         query_id: int,
         context_trits: List[int],
     ) -> bytes:
-        """
-        Always packs THIS node's actual 3D Vivaldi coordinates (self.pos) and
-        current Vivaldi error (self.vivaldi_err) into the 51-byte header.
-        """
         now_us = int(time.perf_counter() * 1_000_000)
         packed_trits = pack_ternary_64(context_trits)
+        flags_ttl = pack_flags_ttl(self.is_fixed, ttl)
         return struct.pack(
             HEADER_FMT,
             MAGIC,
             pkt_type,
-            ttl,
+            flags_ttl,
             query_id,
             self.node_id,
             self.domain_id,
@@ -597,35 +668,61 @@ class P2PLLMNode(asyncio.DatagramProtocol):
             *packed_trits,
         )
 
+    def send_ping_to_peer(self, target_ip: str, target_port: int, query_id: int = 0) -> None:
+        """Sends a clock-skew-immune PKT_PING_BEACON with this node's local timestamp."""
+        if self.transport is None:
+            return
+        now_us = int(time.perf_counter() * 1_000_000)
+        packed_trits = pack_ternary_64(self.vocab_trit_signature)
+        flags_ttl = pack_flags_ttl(self.is_fixed, 1)
+        hdr = struct.pack(
+            HEADER_FMT,
+            MAGIC,
+            PKT_PING_BEACON,
+            flags_ttl,
+            query_id,
+            self.node_id,
+            self.domain_id,
+            now_us,
+            self.pos[0],
+            self.pos[1],
+            self.pos[2],
+            self.vivaldi_err,
+            *packed_trits,
+        )
+        payload = struct.pack(PING_PONG_FMT, now_us, self.port)
+        try:
+            self.transport.sendto(hdr + payload, (target_ip, target_port))
+        except OSError:
+            pass
+
     def _vivaldi_spring_step(
         self,
         sender_id: int,
         sender_domain: int,
+        sender_is_fixed: bool,
         sender_pos: List[float],
         sender_err: float,
-        measured_wire_rtt_ms: float,
+        smoothed_rtt_ms: float,
         sender_trits: List[int],
     ) -> None:
         """
-        Executes a real 3D Vivaldi network coordinate update from a single UDP packet.
-         Euclidean distance ||self.pos - sender_pos|| converges to the effective
-        network target distance L_ij derived from RTT + 64-trit phase impedance.
+        Asymmetric Fixed-Anchor vs. Mobile-Node Vivaldi Coordinate Update:
+          - If THIS node is a Fixed Reference Anchor (self.is_fixed == True),
+            it NEVER moves its 3D coordinates. It acts as an immovable GPS beacon.
+          - If THIS node is a Mobile Node (self.is_fixed == False), it updates its
+            3D coordinates against both Fixed Anchors and other Mobile peers.
+          - When the remote peer is a Fixed Anchor (sender_is_fixed == True, s_err = 0.01),
+            the Vivaldi weight w = e_local / (e_local + 0.01) approaches ~1.0, pulling
+            the mobile node strongly into accurate trilateration around the Fixed Anchors.
         """
-        underlay_rtt = self._synthetic_underlay_rtt_ms(sender_id, sender_domain)
-        effective_rtt_ms = underlay_rtt + min(2.5, measured_wire_rtt_ms * 0.25)
+        if self.is_fixed:
+            self.vivaldi_err = 0.010
+            return
 
-        if sender_id in self.peers:
-            prev_rtt = float(self.peers[sender_id]["rtt_ms"])
-            smoothed_rtt = 0.75 * prev_rtt + 0.25 * effective_rtt_ms
-        else:
-            smoothed_rtt = effective_rtt_ms
-
-        # Phase alignment between this node's vocabulary signature and the sender's packet trits
         phase_sim = ternary_cosine_64(self.vocab_trit_signature, sender_trits)
-        # Rest length L_ij in 3D coordinate units:
-        # Low RTT + high 64-trit resonance -> short spring rest length (~0.65..1.35)
-        # High RTT + orthogonal trits      -> long spring rest length (~2.80..4.40)
-        target_dist = max(0.45, min(4.80, 0.78 * smoothed_rtt + 1.35 * (1.0 - phase_sim)))
+        # Convert RTT + 64-trit phase alignment into target 3D Euclidean rest length L_ij
+        target_dist = max(0.35, min(7.80, 1.05 * smoothed_rtt_ms + 1.45 * (1.0 - phase_sim)))
 
         dx = self.pos[0] - sender_pos[0]
         dy = self.pos[1] - sender_pos[1]
@@ -641,22 +738,22 @@ class P2PLLMNode(asyncio.DatagramProtocol):
         else:
             ux, uy, uz = dx / curr_dist, dy / curr_dist, dz / curr_dist
 
-        # Vivaldi confidence weight w = e_local / (e_local + e_remote)
-        s_err_clamped = max(0.02, min(1.0, sender_err))
+        s_err_clamped = 0.010 if sender_is_fixed else max(0.03, min(1.0, sender_err))
         weight = self.vivaldi_err / (self.vivaldi_err + s_err_clamped)
 
-        # Relative spring error sample
+        # Amplify trilateration lock when pulling against an immovable Fixed Reference Anchor
+        anchor_boost = 1.45 if sender_is_fixed else 0.75
+
         rel_err = abs(curr_dist - target_dist) / max(0.25, target_dist)
         c_e = 0.22
         self.vivaldi_err = max(
-            0.03,
+            0.035,
             min(1.0, self.vivaldi_err * (1.0 - c_e * weight) + c_e * weight * min(1.0, rel_err)),
         )
 
-        # Adaptive spring displacement step along unit vector (curr_dist - target_dist)
-        c_c = 0.18
+        c_c = 0.20 * anchor_boost
         delta = c_c * weight * (curr_dist - target_dist)
-        step_mag = max(-0.32, min(0.32, delta))
+        step_mag = max(-0.38, min(0.38, delta))
 
         self.pos[0] -= step_mag * ux
         self.pos[1] -= step_mag * uy
@@ -711,49 +808,112 @@ class P2PLLMNode(asyncio.DatagramProtocol):
         assoc_hits = self.ternary_expert.top_associative_candidates(query_trits, tabu, top_k=3)
         return [(word, 0.44 * act, act) for word, act in assoc_hits]
 
+    def _update_peer_entry_and_spring(
+        self,
+        sender_id: int,
+        sender_ip: str,
+        sender_port: int,
+        sender_domain: int,
+        sender_is_fixed: bool,
+        sender_pos: List[float],
+        sender_err: float,
+        raw_rtt_ms: float,
+        sender_trits: List[int],
+    ) -> None:
+        if sender_id == self.node_id or sender_id >= 60000:
+            return
+
+        eff_rtt = self._effective_rtt_ms(sender_id, sender_domain, sender_ip, raw_rtt_ms)
+        if sender_id in self.peers:
+            prev_rtt = float(self.peers[sender_id]["rtt_ms"])
+            smoothed_rtt = 0.72 * prev_rtt + 0.28 * eff_rtt
+        else:
+            smoothed_rtt = eff_rtt
+
+        self._vivaldi_spring_step(
+            sender_id=sender_id,
+            sender_domain=sender_domain,
+            sender_is_fixed=sender_is_fixed,
+            sender_pos=sender_pos,
+            sender_err=sender_err,
+            smoothed_rtt_ms=smoothed_rtt,
+            sender_trits=sender_trits,
+        )
+
+        if sender_id in self.peers or len(self.peers) < self.max_peers or sender_is_fixed:
+            self.peers[sender_id] = {
+                "ip": sender_ip,
+                "port": sender_port,
+                "domain_id": sender_domain,
+                "is_fixed": sender_is_fixed,
+                "pos": sender_pos,
+                "err": sender_err,
+                "rtt_ms": smoothed_rtt,
+                "trits": sender_trits,
+            }
+
     def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:
         if len(data) < HEADER_SIZE:
             return
         header = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
-        magic, pkt_type, ttl, query_id, sender_id, sender_domain, ts_us, sx, sy, sz, s_err = header[:11]
+        magic, pkt_type, flags_ttl, query_id, sender_id, sender_domain, ts_us, sx, sy, sz, s_err = header[:11]
         packed_trits = header[11:]
 
         if magic != MAGIC:
             return
 
+        sender_is_fixed, ttl = unpack_flags_ttl(flags_ttl)
         now_us = int(time.perf_counter() * 1_000_000)
-        wire_rtt_ms = max(0.02, (now_us - ts_us) / 1000.0)
         sender_pos = [sx, sy, sz]
         sender_trits = unpack_ternary_64(packed_trits)
+        payload = data[HEADER_SIZE:]
 
-        # Every peer-originated UDP packet updates the peer routing table AND runs a Vivaldi spring step
-        if sender_id != self.node_id and sender_id < 60000:
-            self._vivaldi_spring_step(
+        # 1. Handle PING Beacon (reply immediately with PONG echoing sender's timestamp)
+        if pkt_type == PKT_PING_BEACON and len(payload) >= PING_PONG_SIZE:
+            if sender_id == self.node_id:
+                return
+            echo_ts_us, sender_listen_port = struct.unpack(PING_PONG_FMT, payload[:PING_PONG_SIZE])
+            reply_port = sender_listen_port if sender_listen_port > 0 else addr[1]
+            if self.transport is not None:
+                pong_hdr = self._pack_header(PKT_PONG_REPLY, 1, query_id, self.vocab_trit_signature)
+                pong_payload = struct.pack(PING_PONG_FMT, echo_ts_us, self.port)
+                try:
+                    self.transport.sendto(pong_hdr + pong_payload, (addr[0], reply_port))
+                except OSError:
+                    pass
+            return
+
+        # 2. Handle PONG Reply (compute true clock-skew-immune RTT using OUR OWN clock)
+        if pkt_type == PKT_PONG_REPLY and len(payload) >= PING_PONG_SIZE:
+            echo_ts_us, sender_listen_port = struct.unpack(PING_PONG_FMT, payload[:PING_PONG_SIZE])
+            true_rtt_ms = max(0.02, (now_us - echo_ts_us) / 1000.0)
+            reply_port = sender_listen_port if sender_listen_port > 0 else addr[1]
+            self._update_peer_entry_and_spring(
                 sender_id=sender_id,
+                sender_ip=addr[0],
+                sender_port=reply_port,
                 sender_domain=sender_domain,
+                sender_is_fixed=sender_is_fixed,
                 sender_pos=sender_pos,
                 sender_err=s_err,
-                measured_wire_rtt_ms=wire_rtt_ms,
+                raw_rtt_ms=true_rtt_ms,
                 sender_trits=sender_trits,
             )
-            underlay_rtt = self._synthetic_underlay_rtt_ms(sender_id, sender_domain)
-            eff_rtt = underlay_rtt + min(2.5, wire_rtt_ms * 0.25)
-            if sender_id in self.peers:
-                self.peers[sender_id]["pos"] = sender_pos
-                self.peers[sender_id]["err"] = s_err
-                self.peers[sender_id]["rtt_ms"] = 0.75 * float(self.peers[sender_id]["rtt_ms"]) + 0.25 * eff_rtt
-                self.peers[sender_id]["trits"] = sender_trits
-            elif len(self.peers) < self.max_peers:
-                self.peers[sender_id] = {
-                    "port": addr[1],
-                    "domain_id": sender_domain,
-                    "pos": sender_pos,
-                    "err": s_err,
-                    "rtt_ms": eff_rtt,
-                    "trits": sender_trits,
-                }
+            return
 
-        payload = data[HEADER_SIZE:]
+        # 3. Standard packet processing (for same-host packets or piggybacked updates)
+        same_host_rtt = max(0.02, (now_us - ts_us) / 1000.0) if addr[0] == "127.0.0.1" else 1.5
+        self._update_peer_entry_and_spring(
+            sender_id=sender_id,
+            sender_ip=addr[0],
+            sender_port=addr[1],
+            sender_domain=sender_domain,
+            sender_is_fixed=sender_is_fixed,
+            sender_pos=sender_pos,
+            sender_err=s_err,
+            raw_rtt_ms=same_host_rtt,
+            sender_trits=sender_trits,
+        )
 
         if pkt_type == PKT_QUERY_PULSE and len(payload) >= QUERY_SIZE:
             self._handle_query_pulse(query_id, ttl, sender_trits, payload)
@@ -777,16 +937,20 @@ class P2PLLMNode(asyncio.DatagramProtocol):
             return
         self.seen_queries.append(query_id)
 
-        origin_port, spatial_lambda, ox, oy, oz, raw_w2, raw_w1, raw_wc = struct.unpack(
+        raw_ip, origin_port, spatial_lambda, ox, oy, oz, raw_w2, raw_w1, raw_wc = struct.unpack(
             QUERY_FMT, payload[:QUERY_SIZE]
         )
+        try:
+            origin_ip = socket.inet_ntoa(raw_ip)
+        except OSError:
+            origin_ip = "127.0.0.1"
+
         origin_pos = (ox, oy, oz)
         w_prev2 = decode_word_16(raw_w2)
         w_prev1 = decode_word_16(raw_w1)
         w_curr = decode_word_16(raw_wc)
 
-        # Kleinberg Small-World Geometric Gossip Forwarding:
-        # Packs THIS node's self.pos in the header while keeping origin_pos in QUERY_FMT payload
+        # Kleinberg Small-World Geometric Gossip Forwarding (preserves origin_ip:origin_port in payload)
         if ttl > 1 and self.transport is not None and self.peers:
             fwd_hdr = self._pack_header(PKT_QUERY_PULSE, ttl - 1, query_id, query_trits)
             ranked_peers = sorted(
@@ -797,7 +961,10 @@ class P2PLLMNode(asyncio.DatagramProtocol):
             if len(ranked_peers) > 3:
                 targets.append(self.rng.choice(ranked_peers[3:]))
             for p_info in targets:
-                self.transport.sendto(fwd_hdr + payload, ("127.0.0.1", int(p_info["port"])))
+                try:
+                    self.transport.sendto(fwd_hdr + payload, (str(p_info["ip"]), int(p_info["port"])))
+                except OSError:
+                    pass
 
         candidates = self.predict_local_candidates(w_prev2, w_prev1, w_curr, query_trits)
         if not candidates or self.transport is None:
@@ -817,7 +984,10 @@ class P2PLLMNode(asyncio.DatagramProtocol):
                 phase_align,
                 self.refractory_energy,
             )
-            self.transport.sendto(hdr + prop_payload, ("127.0.0.1", origin_port))
+            try:
+                self.transport.sendto(hdr + prop_payload, (origin_ip, origin_port))
+            except OSError:
+                pass
 
     def _handle_hebbian_reward(
         self,
@@ -833,13 +1003,9 @@ class P2PLLMNode(asyncio.DatagramProtocol):
 
         has_word = winning_word in self.unigrams
         if has_word and reward > 0:
-            # 1. Online Ternary Synaptic Reinforcement
             self.ternary_expert.reinforce(context_trits, winning_word, strength=1)
-            # 2. Spatial Refractory Inhibition
             self.refractory_energy = max(0.35, self.refractory_energy * 0.72)
 
-            # 3. Emit Peer-to-Peer PKT_SYNAPTIC_GOSSIP to low-RTT Vivaldi neighbors
-            #    so Vivaldi-proximate nodes absorb co-activating vocabulary AND trigger Vivaldi springs
             if self.transport is not None and self.peers:
                 gossip_trits = compute_ternary_64([w_prev1, w_curr, winning_word])
                 gossip_hdr = self._pack_header(PKT_SYNAPTIC_GOSSIP, max(1, ttl), query_id, gossip_trits)
@@ -848,7 +1014,10 @@ class P2PLLMNode(asyncio.DatagramProtocol):
                 if len(by_rtt) > 3:
                     gossip_targets.append(self.rng.choice(by_rtt[3:]))
                 for p_info in gossip_targets:
-                    self.transport.sendto(gossip_hdr + payload, ("127.0.0.1", int(p_info["port"])))
+                    try:
+                        self.transport.sendto(gossip_hdr + payload, (str(p_info["ip"]), int(p_info["port"])))
+                    except OSError:
+                        pass
         else:
             self.refractory_energy = min(1.0, self.refractory_energy + 0.18)
 
@@ -859,11 +1028,6 @@ class P2PLLMNode(asyncio.DatagramProtocol):
         sender_trits: List[int],
         payload: bytes,
     ) -> None:
-        """
-        Receives a peer-to-peer synaptic gossip packet over UDP. If the sender is
-        in our low-RTT / resonant Vivaldi neighborhood, we absorb the word transition
-        and 64-trit synaptic trace into our local model.
-        """
         gossip_key = (query_id, ttl)
         if gossip_key in self.seen_gossip:
             return
@@ -882,11 +1046,18 @@ class P2PLLMNode(asyncio.DatagramProtocol):
             fwd_hdr = self._pack_header(PKT_SYNAPTIC_GOSSIP, ttl - 1, query_id, sender_trits)
             by_rtt = sorted(self.peers.values(), key=lambda p: float(p["rtt_ms"]))
             for p_info in by_rtt[:2]:
-                self.transport.sendto(fwd_hdr + payload, ("127.0.0.1", int(p_info["port"])))
+                try:
+                    self.transport.sendto(fwd_hdr + payload, (str(p_info["ip"]), int(p_info["port"])))
+                except OSError:
+                    pass
 
     def _apply_repulsion_and_confinement(self) -> None:
+        """Mobile nodes experience gentle inverse-square repulsion and spherical confinement; Fixed Anchors never move."""
+        if self.is_fixed:
+            return
+
         num_peers = max(1, len(self.peers))
-        k_rep = 0.055 / math.sqrt(num_peers)
+        k_rep = 0.048 / math.sqrt(num_peers)
         eps = 0.28
         force = [0.0, 0.0, 0.0]
 
@@ -901,7 +1072,7 @@ class P2PLLMNode(asyncio.DatagramProtocol):
             force[1] += k_rep * dy / denom
             force[2] += k_rep * dz / denom
 
-        r_max = 4.2
+        r_max = 4.3
         norm = math.sqrt(sum(c * c for c in self.pos))
         if norm > r_max:
             excess = norm - r_max
@@ -909,20 +1080,48 @@ class P2PLLMNode(asyncio.DatagramProtocol):
                 force[dim] -= 0.25 * excess * (self.pos[dim] / norm)
 
         for dim in range(3):
-            self.pos[dim] += max(-0.28, min(0.28, force[dim]))
+            self.pos[dim] += max(-0.25, min(0.25, force[dim]))
 
 
 # ============================================================================
-# 6. QUERY ORIGIN COLLECTOR (UDP SOCKET AGGREGATOR + DECENTRALIZED VIEW)
+# 6. LAN UDP BROADCAST DISCOVERY BUS & QUERY ORIGIN COLLECTOR
 # ============================================================================
+class LANDiscoveryBus(asyncio.DatagramProtocol):
+    """
+    Listens on a shared UDP broadcast port (default 9999) with SO_BROADCAST and
+    SO_REUSEADDR so multiple phones and PCs on Wi-Fi / Hotspot discover each
+    other automatically and forward PKT_PING_BEACON packets to local nodes.
+    """
+
+    def __init__(self, local_nodes: List[P2PLLMNode]):
+        self.local_nodes = local_nodes
+        self.transport: Optional[asyncio.DatagramTransport] = None
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore
+
+    def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:
+        if len(data) < HEADER_SIZE + PING_PONG_SIZE:
+            return
+        header = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
+        magic, pkt_type, _, _, sender_id = header[:5]
+        if magic != MAGIC or pkt_type != PKT_PING_BEACON:
+            return
+
+        # Deliver incoming LAN broadcast beacon to local nodes so they reply with PONG
+        for node in self.local_nodes:
+            if node.node_id != sender_id:
+                node.datagram_received(data, addr)
+
+
 class QueryOriginCollector(asyncio.DatagramProtocol):
-    def __init__(self):
+    def __init__(self, bind_ip: str = "127.0.0.1"):
+        self.bind_ip = bind_ip
         self.transport: Optional[asyncio.DatagramTransport] = None
         self.port: int = 0
         self.active_query_id: int = 0
         self.query_start_us: int = 0
         self.proposals: List[Dict[str, object]] = []
-        # Decentralized peer cache learned strictly from incoming UDP proposals
         self.known_peers: Dict[int, Dict[str, object]] = {}
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
@@ -933,16 +1132,19 @@ class QueryOriginCollector(asyncio.DatagramProtocol):
         if len(data) < HEADER_SIZE + PROPOSAL_SIZE:
             return
         header = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
-        magic, pkt_type, ttl, query_id, sender_id, sender_domain, ts_us, sx, sy, sz, s_err = header[:11]
+        magic, pkt_type, flags_ttl, query_id, sender_id, sender_domain, ts_us, sx, sy, sz, s_err = header[:11]
         if magic != MAGIC or pkt_type != PKT_TOKEN_PROPOSAL:
             return
 
+        sender_is_fixed, _ = unpack_flags_ttl(flags_ttl)
         now_us = int(time.perf_counter() * 1_000_000)
         rtt_ms = max(0.02, (now_us - self.query_start_us) / 1000.0)
 
         self.known_peers[sender_id] = {
+            "ip": addr[0],
             "port": addr[1],
             "domain_id": sender_domain,
+            "is_fixed": sender_is_fixed,
             "pos": (sx, sy, sz),
             "vivaldi_err": s_err,
             "rtt_ms": rtt_ms,
@@ -958,8 +1160,10 @@ class QueryOriginCollector(asyncio.DatagramProtocol):
         self.proposals.append(
             {
                 "sender_id": sender_id,
+                "ip": addr[0],
                 "port": addr[1],
                 "domain_id": sender_domain,
+                "is_fixed": sender_is_fixed,
                 "pos": (sx, sy, sz),
                 "vivaldi_err": s_err,
                 "rtt_ms": rtt_ms,
@@ -973,20 +1177,34 @@ class QueryOriginCollector(asyncio.DatagramProtocol):
 
 
 # ============================================================================
-# 7. SWARM ORCHESTRATOR & AUTONOMOUS 3D VIVALDI WAVEFRONT SURFER
+# 7. SWARM ORCHESTRATOR (FIXED ANCHORS + MOBILE NODES + LAN BEACONS)
 # ============================================================================
 class P2PSpatialSwarm:
-    def __init__(self, nodes_per_domain: int = 8, seed: int = 42):
+    def __init__(
+        self,
+        nodes_per_domain: int = 8,
+        fixed_per_domain: int = 2,
+        seed: int = 42,
+        lan_enable: bool = False,
+        discovery_port: int = 9999,
+    ):
         self.rng = random.Random(seed)
         self.nodes: List[P2PLLMNode] = []
-        self.collector = QueryOriginCollector()
-        self.nodes_per_domain = nodes_per_domain
+        self.nodes_per_domain = max(2, nodes_per_domain)
+        self.fixed_per_domain = max(1, min(fixed_per_domain, self.nodes_per_domain - 1))
+        self.lan_enable = lan_enable
+        self.discovery_port = discovery_port
+        self.bind_ip = detect_lan_ipv4() if lan_enable else "127.0.0.1"
+        self.collector = QueryOriginCollector(bind_ip=self.bind_ip)
+        self.discovery_bus: Optional[LANDiscoveryBus] = None
+        self.discovery_sock: Optional[socket.socket] = None
         self.query_counter = 1000
         self.last_trajectory: List[Tuple[float, float, float]] = []
 
     async def boot_swarm(self, custom_dir: Optional[str] = None) -> None:
         loop = asyncio.get_running_loop()
-        await loop.create_datagram_endpoint(lambda: self.collector, local_addr=("127.0.0.1", 0))
+        listen_host = "0.0.0.0" if self.lan_enable else "127.0.0.1"
+        await loop.create_datagram_endpoint(lambda: self.collector, local_addr=(listen_host, 0))
 
         if custom_dir:
             loaded_sentences = extract_clean_sentences_from_path(custom_dir)
@@ -999,32 +1217,76 @@ class P2PSpatialSwarm:
 
         node_id = 1
         for domain_id, corpus in DOMAIN_CORPORA.items():
+            anchor_base = FIXED_TETRAHEDRAL_ANCHORS[domain_id]
             for i in range(self.nodes_per_domain):
                 rotated = corpus[i % len(corpus) :] + corpus[: i % len(corpus)]
                 selected_sentences = rotated[:6]
-                rand_pos = (
-                    self.rng.uniform(-3.6, 3.6),
-                    self.rng.uniform(-3.6, 3.6),
-                    self.rng.uniform(-3.6, 3.6),
+                is_fixed = i < self.fixed_per_domain
+
+                if is_fixed:
+                    # Fixed Reference Anchors sit at the canonical tetrahedral vertices
+                    offset = 0.18 * i
+                    init_pos = (
+                        anchor_base[0] - offset if anchor_base[0] > 0 else anchor_base[0] + offset,
+                        anchor_base[1] - offset if anchor_base[1] > 0 else anchor_base[1] + offset,
+                        anchor_base[2] - offset if anchor_base[2] > 0 else anchor_base[2] + offset,
+                    )
+                else:
+                    # Mobile nodes start scattered across 3D space and must trilaterate via RTT pings
+                    init_pos = (
+                        self.rng.uniform(-3.6, 3.6),
+                        self.rng.uniform(-3.6, 3.6),
+                        self.rng.uniform(-3.6, 3.6),
+                    )
+
+                node = P2PLLMNode(
+                    node_id=node_id,
+                    domain_id=domain_id,
+                    sentences=selected_sentences,
+                    initial_pos=init_pos,
+                    rng=self.rng,
+                    is_fixed=is_fixed,
+                    bind_ip=self.bind_ip,
                 )
-                node = P2PLLMNode(node_id, domain_id, selected_sentences, rand_pos, self.rng)
-                await loop.create_datagram_endpoint(lambda n=node: n, local_addr=("127.0.0.1", 0))
+                await loop.create_datagram_endpoint(lambda n=node: n, local_addr=(listen_host, 0))
                 self.nodes.append(node)
-                # Seed collector bootstrap view with initial node descriptors
                 self.collector.known_peers[node.node_id] = {
+                    "ip": self.bind_ip,
                     "port": node.port,
                     "domain_id": node.domain_id,
+                    "is_fixed": node.is_fixed,
                     "pos": tuple(node.pos),
                     "vivaldi_err": node.vivaldi_err,
                     "rtt_ms": 1.0,
                 }
                 node_id += 1
 
-        k_init = min(14, max(8, len(self.nodes) // 2))
+        k_init = min(16, max(10, len(self.nodes) // 2))
         for node in self.nodes:
             node.register_peers(self.nodes, k_neighbors=k_init)
 
+        # Optional LAN UDP Broadcast Discovery socket (port 9999) for multi-phone / multi-PC coordination
+        if self.lan_enable:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if hasattr(socket, "SO_REUSEPORT"):
+                    try:
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                    except OSError:
+                        pass
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.bind(("0.0.0.0", self.discovery_port))
+                sock.setblocking(False)
+                self.discovery_sock = sock
+                self.discovery_bus = LANDiscoveryBus(self.nodes)
+                await loop.create_datagram_endpoint(lambda: self.discovery_bus, sock=sock)
+            except OSError:
+                self.discovery_sock = None
+
     def close_swarm(self) -> None:
+        if self.discovery_bus and self.discovery_bus.transport:
+            self.discovery_bus.transport.close()
         if self.collector.transport:
             self.collector.transport.close()
         for node in self.nodes:
@@ -1035,75 +1297,114 @@ class P2PSpatialSwarm:
         for node in self.nodes:
             node.refractory_energy = 1.0
 
-    def compute_clustering_ratio(self) -> Tuple[float, float, float, float]:
-        intra_dists, inter_dists = [], []
-        for i in range(len(self.nodes)):
-            for j in range(i + 1, len(self.nodes)):
-                na, nb = self.nodes[i], self.nodes[j]
-                d = math.sqrt(sum((na.pos[k] - nb.pos[k]) ** 2 for k in range(3)))
-                if na.domain_id == nb.domain_id:
-                    intra_dists.append(d)
-                else:
-                    inter_dists.append(d)
-        mean_intra = sum(intra_dists) / max(1, len(intra_dists))
-        mean_inter = sum(inter_dists) / max(1, len(inter_dists))
-        mean_err = sum(n.vivaldi_err for n in self.nodes) / max(1, len(self.nodes))
-        return mean_intra, mean_inter, mean_intra / max(1e-6, mean_inter), mean_err
+    def compute_trilateration_metrics(self) -> Tuple[float, float, float, float]:
+        """
+        Computes clustering metrics specifically showing how well Mobile Nodes
+        have trilaterated around their respective Fixed Reference Anchors.
+        Returns: (mobile_to_own_anchor_dist, mobile_to_other_anchor_dist, ratio, mean_mobile_vivaldi_err)
+        """
+        own_dists, other_dists = [], []
+        fixed_by_dom: Dict[int, List[P2PLLMNode]] = collections.defaultdict(list)
+        for n in self.nodes:
+            if n.is_fixed:
+                fixed_by_dom[n.domain_id].append(n)
+
+        mobile_nodes = [n for n in self.nodes if not n.is_fixed]
+        for mob in mobile_nodes:
+            for dom_id, anchors in fixed_by_dom.items():
+                for anc in anchors:
+                    d = math.sqrt(sum((mob.pos[k] - anc.pos[k]) ** 2 for k in range(3)))
+                    if dom_id == mob.domain_id:
+                        own_dists.append(d)
+                    else:
+                        other_dists.append(d)
+
+        mean_own = sum(own_dists) / max(1, len(own_dists))
+        mean_other = sum(other_dists) / max(1, len(other_dists))
+        mean_mob_err = sum(n.vivaldi_err for n in mobile_nodes) / max(1, len(mobile_nodes))
+        return mean_own, mean_other, mean_own / max(1e-6, mean_other), mean_mob_err
 
     def get_domain_centroids(self) -> Dict[int, Tuple[float, float, float]]:
+        """Returns the Fixed Reference Anchor coordinates for each domain."""
         centroids: Dict[int, Tuple[float, float, float]] = {}
         for dom_id in DOMAIN_NAMES:
-            dom_nodes = [n for n in self.nodes if n.domain_id == dom_id]
-            if not dom_nodes:
+            fixed_nodes = [n for n in self.nodes if n.domain_id == dom_id and n.is_fixed]
+            target_list = fixed_nodes if fixed_nodes else [n for n in self.nodes if n.domain_id == dom_id]
+            if not target_list:
                 continue
-            cx = sum(n.pos[0] for n in dom_nodes) / len(dom_nodes)
-            cy = sum(n.pos[1] for n in dom_nodes) / len(dom_nodes)
-            cz = sum(n.pos[2] for n in dom_nodes) / len(dom_nodes)
+            cx = sum(n.pos[0] for n in target_list) / len(target_list)
+            cy = sum(n.pos[1] for n in target_list) / len(target_list)
+            cz = sum(n.pos[2] for n in target_list) / len(target_list)
             centroids[dom_id] = (cx, cy, cz)
         return centroids
 
-    async def run_hebbian_self_organization(self, epochs: int = 120) -> None:
+    async def run_ping_pong_trilateration_And_gossip(self, epochs: int = 140) -> None:
         """
-        Peers exchange real PKT_SYNAPTIC_GOSSIP UDP packets with their neighbors.
-        Every UDP packet runs a Vivaldi RTT + 64-trit spring update inside
-        datagram_received, converging both 3D coordinates and vivaldi_err.
+        1. Mobile nodes send real two-way PKT_PING_BEACON packets to Fixed Anchors
+           and peers; Fixed Anchors reply with PKT_PONG_REPLY echoing the sender's
+           timestamp so mobile nodes trilaterate their 3D position on a single clock.
+        2. Peers exchange PKT_SYNAPTIC_GOSSIP to migrate co-activating vocabulary
+           and 64-trit weights across low-RTT neighborhoods.
         """
-        for _ in range(epochs):
+        for ep in range(epochs):
+            # Step A: Two-Way Ping/Pong RTT Trilateration Probe against Fixed Anchors + Peers
+            probe_node = self.rng.choice(self.nodes)
+            if probe_node.peers:
+                peer_list = list(probe_node.peers.values())
+                # Prioritize pinging Fixed Reference Anchors for fast GPS lock
+                anchors = [p for p in peer_list if bool(p.get("is_fixed", False))]
+                mobiles = [p for p in peer_list if not bool(p.get("is_fixed", False))]
+                targets = anchors + self.rng.sample(mobiles, min(3, len(mobiles)))
+                for p_info in targets:
+                    self.query_counter += 1
+                    probe_node.send_ping_to_peer(
+                        str(p_info["ip"]),
+                        int(p_info["port"]),
+                        query_id=self.query_counter,
+                    )
+
+            # Optional LAN broadcast beacon every 35 epochs when --lan is active
+            if self.lan_enable and ep % 35 == 0 and self.nodes:
+                beacon_node = self.rng.choice(self.nodes)
+                beacon_node.send_ping_to_peer("255.255.255.255", self.discovery_port, query_id=self.query_counter)
+
+            # Step B: Synaptic Vocabulary Gossip
             initiator = self.rng.choice(self.nodes)
             corpus = DOMAIN_CORPORA[initiator.domain_id]
-            if not corpus or initiator.transport is None:
-                continue
-            sentence = self.rng.choice(corpus).split()
-            if len(sentence) < 4:
-                continue
-            idx = self.rng.randint(2, len(sentence) - 2)
-            w_prev2, w_prev1, w_curr = sentence[idx - 2], sentence[idx - 1], sentence[idx]
-            target_next = sentence[idx + 1]
+            if corpus and initiator.transport is not None:
+                sentence = self.rng.choice(corpus).split()
+                if len(sentence) >= 4:
+                    idx = self.rng.randint(2, len(sentence) - 2)
+                    w_prev2, w_prev1, w_curr = sentence[idx - 2], sentence[idx - 1], sentence[idx]
+                    target_next = sentence[idx + 1]
 
-            self.query_counter += 1
-            trits = compute_ternary_64([w_prev2, w_prev1, w_curr, target_next])
-            hdr = initiator._pack_header(PKT_SYNAPTIC_GOSSIP, 2, self.query_counter, trits)
-            rew_payload = struct.pack(
-                REWARD_FMT,
-                encode_word_16(w_prev1),
-                encode_word_16(w_curr),
-                encode_word_16(target_next),
-                1.0,
-            )
-
-            # Send directly to peer subset in initiator's peer routing table
-            peer_list = list(initiator.peers.values())
-            sampled_peers = self.rng.sample(peer_list, min(6, len(peer_list)))
-            for p_info in sampled_peers:
-                initiator.transport.sendto(hdr + rew_payload, ("127.0.0.1", int(p_info["port"])))
+                    self.query_counter += 1
+                    trits = compute_ternary_64([w_prev2, w_prev1, w_curr, target_next])
+                    hdr = initiator._pack_header(PKT_SYNAPTIC_GOSSIP, 2, self.query_counter, trits)
+                    rew_payload = struct.pack(
+                        REWARD_FMT,
+                        encode_word_16(w_prev1),
+                        encode_word_16(w_curr),
+                        encode_word_16(target_next),
+                        1.0,
+                    )
+                    peer_list = list(initiator.peers.values())
+                    for p_info in self.rng.sample(peer_list, min(5, len(peer_list))):
+                        try:
+                            initiator.transport.sendto(
+                                hdr + rew_payload, (str(p_info["ip"]), int(p_info["port"]))
+                            )
+                        except OSError:
+                            pass
 
             await asyncio.sleep(0.003)
 
-        # Refresh collector's peer coordinate cache after convergence
         for node in self.nodes:
             self.collector.known_peers[node.node_id] = {
+                "ip": node.bind_ip,
                 "port": node.port,
                 "domain_id": node.domain_id,
+                "is_fixed": node.is_fixed,
                 "pos": (node.pos[0], node.pos[1], node.pos[2]),
                 "vivaldi_err": node.vivaldi_err,
                 "rtt_ms": node.mean_peer_rtt(),
@@ -1127,7 +1428,7 @@ class P2PSpatialSwarm:
             HEADER_FMT,
             MAGIC,
             PKT_LIVE_INJECT,
-            1,
+            pack_flags_ttl(True, 1),
             self.query_counter,
             65000,
             domain_id,
@@ -1135,24 +1436,20 @@ class P2PSpatialSwarm:
             anchor_pos[0],
             anchor_pos[1],
             anchor_pos[2],
-            0.05,
+            0.01,
             *packed_trits,
         )
         raw_sentence = sentence.encode("utf-8")[:220]
         updated = 0
         for node in self.nodes:
             if node.domain_id == domain_id:
-                self.collector.transport.sendto(hdr + raw_sentence, ("127.0.0.1", node.port))
+                self.collector.transport.sendto(hdr + raw_sentence, (node.bind_ip, node.port))
                 updated += 1
         DOMAIN_CORPORA[domain_id].append(" ".join(words))
         await asyncio.sleep(0.010)
         return updated
 
     async def load_path_into_swarm(self, target_path: str) -> int:
-        """
-        Routes each extracted sentence to the UDP peers whose 64-trit vocabulary
-        signature has the highest phase resonance with the sentence's 64-trit vector.
-        """
         sentences = extract_clean_sentences_from_path(target_path)
         if not sentences or self.collector.transport is None:
             return 0
@@ -1161,7 +1458,6 @@ class P2PSpatialSwarm:
             words = sent.split()
             sent_trits = compute_ternary_64(words)
             packed_trits = pack_ternary_64(sent_trits)
-            # Rank nodes by 64-trit resonance with the sentence
             ranked_nodes = sorted(
                 self.nodes,
                 key=lambda n: ternary_cosine_64(sent_trits, n.vocab_trit_signature),
@@ -1176,7 +1472,7 @@ class P2PSpatialSwarm:
                 HEADER_FMT,
                 MAGIC,
                 PKT_LIVE_INJECT,
-                1,
+                pack_flags_ttl(True, 1),
                 self.query_counter,
                 65000,
                 dom_id,
@@ -1184,12 +1480,12 @@ class P2PSpatialSwarm:
                 target_nodes[0].pos[0],
                 target_nodes[0].pos[1],
                 target_nodes[0].pos[2],
-                0.05,
+                0.01,
                 *packed_trits,
             )
             raw_sentence = sent.encode("utf-8")[:220]
             for node in target_nodes:
-                self.collector.transport.sendto(hdr + raw_sentence, ("127.0.0.1", node.port))
+                self.collector.transport.sendto(hdr + raw_sentence, (node.bind_ip, node.port))
             await asyncio.sleep(0.002)
 
         return len(sentences)
@@ -1203,12 +1499,6 @@ class P2PSpatialSwarm:
         latency_mu: float = 0.03,
         base_window_sec: float = 0.022,
     ) -> Tuple[str, List[Tuple[str, float, int]], int, Tuple[float, float, float]]:
-        """
-        Broadcasts a binary QUERY_PULSE from `origin_pos` over UDP using the
-        Collector's decentralized `known_peers` table, scores incoming proposals
-        by Vivaldi 3D distance + confidence + 64-trit activation, and sends
-        PKT_HEBBIAN_REWARD to responding peers so they trigger Vivaldi + synaptic gossip.
-        """
         self.query_counter += 1
         qid = self.query_counter
         self.collector.active_query_id = qid
@@ -1224,7 +1514,7 @@ class P2PSpatialSwarm:
             HEADER_FMT,
             MAGIC,
             PKT_QUERY_PULSE,
-            2,
+            pack_flags_ttl(False, 2),
             qid,
             65000,
             0,
@@ -1235,8 +1525,10 @@ class P2PSpatialSwarm:
             0.05,
             *packed_trits,
         )
+        origin_ip_bytes = socket.inet_aton(self.collector.bind_ip)
         payload = struct.pack(
             QUERY_FMT,
+            origin_ip_bytes,
             self.collector.port,
             spatial_lambda,
             origin_pos[0],
@@ -1247,7 +1539,6 @@ class P2PSpatialSwarm:
             encode_word_16(w_curr),
         )
 
-        # Decentralized Kleinberg Small-World Entry Selection from Collector's known_peers table
         peer_descriptors = list(self.collector.known_peers.values())
         sorted_by_dist = sorted(
             peer_descriptors,
@@ -1261,7 +1552,12 @@ class P2PSpatialSwarm:
 
         for peer_desc in near_peers + far_peers:
             if self.collector.transport is not None:
-                self.collector.transport.sendto(hdr + payload, ("127.0.0.1", int(peer_desc["port"])))
+                try:
+                    self.collector.transport.sendto(
+                        hdr + payload, (str(peer_desc["ip"]), int(peer_desc["port"]))
+                    )
+                except OSError:
+                    pass
 
         dynamic_window = base_window_sec + (0.0012 * len(peer_descriptors))
         await asyncio.sleep(dynamic_window)
@@ -1271,7 +1567,7 @@ class P2PSpatialSwarm:
         token_coord_moments: Dict[str, List[float]] = collections.defaultdict(lambda: [0.0, 0.0, 0.0, 0.0])
         seen_node_word: Set[Tuple[int, str]] = set()
         recent_tabu = set(w.lower() for w in context_words[-5:])
-        winning_peer_ports: Dict[str, List[int]] = collections.defaultdict(list)
+        winning_peer_endpoints: Dict[str, List[Tuple[str, int]]] = collections.defaultdict(list)
 
         for prop in self.collector.proposals:
             nid = int(prop["sender_id"])
@@ -1287,9 +1583,10 @@ class P2PSpatialSwarm:
                 + (origin_pos[2] - pz) ** 2
             )
 
-            # Weight proposals by Vivaldi coordinate confidence (1 / (1 + vivaldi_err))
             v_err = float(prop["vivaldi_err"])
-            w_vivaldi_conf = 1.0 / (1.0 + 0.5 * v_err)
+            is_fixed_peer = bool(prop.get("is_fixed", False))
+            # Fixed Reference Anchors have zero coordinate uncertainty and provide high-stability proposals
+            w_vivaldi_conf = (1.12 if is_fixed_peer else 1.0) / (1.0 + 0.5 * v_err)
             w_topo = math.exp(-spatial_lambda * dist_sq)
             w_lat = math.exp(-latency_mu * float(prop["rtt_ms"]))
             w_syn = 0.55 + 0.45 * float(prop["ternary_syn"])
@@ -1299,7 +1596,7 @@ class P2PSpatialSwarm:
 
             composite_weight = local_conf * w_topo * w_lat * w_syn * w_phase * w_refrac * w_vivaldi_conf
             token_scores[word] += composite_weight
-            winning_peer_ports[word].append(int(prop["port"]))
+            winning_peer_endpoints[word].append((str(prop["ip"]), int(prop["port"])))
 
             mom = token_coord_moments[word]
             mom[0] += composite_weight * px
@@ -1332,12 +1629,11 @@ class P2PSpatialSwarm:
         else:
             win_center = origin_pos
 
-        # Send Hebbian Reward to the responding peers (which then trigger peer-to-peer Vivaldi + synaptic gossip)
         rew_hdr = struct.pack(
             HEADER_FMT,
             MAGIC,
             PKT_HEBBIAN_REWARD,
-            2,
+            pack_flags_ttl(False, 2),
             qid,
             65000,
             0,
@@ -1355,12 +1651,15 @@ class P2PSpatialSwarm:
             encode_word_16(winning_word),
             0.35,
         )
-        target_ports = set(winning_peer_ports[winning_word])
+        target_endpoints = set(winning_peer_endpoints[winning_word])
         for prop in self.collector.proposals[:8]:
-            target_ports.add(int(prop["port"]))
-        for port in target_ports:
+            target_endpoints.add((str(prop["ip"]), int(prop["port"])))
+        for ip_str, port_num in target_endpoints:
             if self.collector.transport is not None:
-                self.collector.transport.sendto(rew_hdr + rew_payload, ("127.0.0.1", port))
+                try:
+                    self.collector.transport.sendto(rew_hdr + rew_payload, (ip_str, port_num))
+                except OSError:
+                    pass
 
         await asyncio.sleep(0.005)
         return winning_word, probs[:4], len(seen_node_word), win_center
@@ -1391,17 +1690,11 @@ async def generate_sequence(
     surf_rate: float = 0.35,
     verbose_trace: int = 3,
 ) -> Tuple[float, float, float]:
-    """
-    Generates a token sequence while maintaining a continuous 64-float recurrent
-    phase trace across the entire prompt and surfing the 3D Vivaldi network
-    coordinate space toward winning peer clusters.
-    """
     swarm.reset_refractory()
     context = [w.strip().lower() for w in prompt.strip().split() if w.strip()]
     if not context:
         return start_pos
 
-    # Initialize full-prompt recurrent 64-float phase trace
     recurrent_trace = [0.0] * TRIT_DIM
     for tok in context:
         recurrent_trace = update_recurrent_trace(recurrent_trace, tok, decay=0.84)
@@ -1456,29 +1749,32 @@ async def interactive_repl(
 ) -> None:
     centroids = swarm.get_domain_centroids()
     active_pos: Tuple[float, float, float] = centroids.get(0, (0.0, 0.0, 0.0))
-    active_label: str = f"Near {DOMAIN_NAMES[0]}"
+    active_label: str = f"Fixed Anchor {DOMAIN_SYMBOLS[0]}"
     spatial_lambda: float = 0.85
     surf_rate: float = default_surf
     steps: int = default_steps
 
-    print("\n" + "=" * 78)
-    print(" INTERACTIVE P2P VIVALDI-COORDINATE LLM REPL v4.0 (RTT SPRINGS + 64-TRIT)")
-    print("=" * 78)
+    print("\n" + "=" * 80)
+    print(" INTERACTIVE P2P VIVALDI LLM REPL v5.0 (FIXED ANCHORS + MOBILE TRILATERATION)")
+    print("=" * 80)
     print(" Commands:")
-    print("   <any text>                 Generate tokens (and surf 3D Vivaldi space) from '@' Origin")
-    print("   /cluster <p|d|m|c>         Snap '@' Origin to Physics, P2P, ML, or Control centroid")
-    print("   /coord <x> <y> <z>         Move '@' Origin to custom 3D coordinates (e.g. /coord 0 0 0)")
-    print("   /surf <0.0..1.0>           Set 3D Query Surfing rate γ (0 = locked, 0.4 = dynamic drift)")
-    print("   /lambda <float>            Set Spatial Gravity Decay λ (e.g. /lambda 1.2 or /lambda 0.12)")
-    print("   /steps <int>               Set max tokens generated per prompt")
-    print("   /map                       Render 2D Braille topology + last 3D query surf trail (o->@)")
-    print("   /sweep <prompt>            Fire prompt across all 4 domain centroids + (0,0,0) bridge")
-    print("   /inject <p|d|m|c> <text>   Teach a new sentence to a domain cluster over UDP")
-    print("   /load <file_or_dir_path>   Semantically route local .txt/.md/.py files into UDP peers")
-    print("   /train <epochs>            Run extra Vivaldi RTT spring + 64-trit synaptic gossip epochs")
-    print("   /peers                     Inspect UDP ports, 3D Vivaldi coords, Vivaldi Err, & RTT")
-    print("   /quit                      Close UDP sockets and exit")
-    print("=" * 78)
+    print("   <any text>                   Generate tokens & surf across Fixed Anchors + Mobile nodes")
+    print("   /cluster <p|d|m|c>           Snap '@' Origin to Physics, P2P, ML, or Control Fixed Anchor")
+    print("   /coord <x> <y> <z>           Move '@' Origin to custom 3D coordinates (e.g. /coord 0 0 0)")
+    print("   /surf <0.0..1.0>             Set 3D Query Surfing rate γ (0 = locked, 0.35 = dynamic surf)")
+    print("   /lambda <float>              Set Spatial Gravity Decay λ (e.g. /lambda 0.85 or /lambda 0.14)")
+    print("   /steps <int>                 Set max tokens generated per prompt")
+    print("   /map                         Render 2D Braille map ([P/D/M/C]=Fixed, [p/d/m/c]=Mobile)")
+    print("   /anchors                     Inspect Fixed Reference Anchors vs. Mobile Trilaterating Nodes")
+    print("   /role <node_id> <fixed|mob>  Lock a node in place as a Fixed Anchor or unlock to Mobile")
+    print("   /ping                        Fire a live two-way PING/PONG RTT trilateration sweep")
+    print("   /sweep <prompt>              Fire prompt across all 4 Fixed Tetrahedral Anchors + (0,0,0)")
+    print("   /inject <p|d|m|c> <text>     Teach a new sentence to a domain cluster over UDP")
+    print("   /load <file_or_dir_path>     Semantically route local .txt/.md/.py files into UDP peers")
+    print("   /train <epochs>              Run extra Ping/Pong Trilateration + Synaptic Gossip epochs")
+    print("   /peers                       Inspect UDP endpoints, Role (FIXED/MOB), VivErr, & RTT")
+    print("   /quit                        Close UDP sockets and exit")
+    print("=" * 80)
 
     loop = asyncio.get_running_loop()
 
@@ -1510,18 +1806,63 @@ async def interactive_repl(
                     )
                 )
 
+            elif op == "/anchors":
+                fixed_list = [n for n in swarm.nodes if n.is_fixed]
+                mob_list = [n for n in swarm.nodes if not n.is_fixed]
+                own_d, oth_d, ratio, m_err = swarm.compute_trilateration_metrics()
+                print(f"  Fixed Reference Anchors : {len(fixed_list)} nodes (locked at tetrahedral landmarks, VivErr=0.010)")
+                print(f"  Mobile Drifting Nodes   : {len(mob_list)} nodes (Mean Vivaldi Err={m_err:.3f})")
+                print(f"  Trilateration Lock      : Own-Anchor Dist={own_d:.3f} | Other-Anchor Dist={oth_d:.3f} | Ratio={ratio:.3f}")
+                print("  " + "-" * 86)
+                for anc in fixed_list:
+                    dname = DOMAIN_NAMES[anc.domain_id][:24].ljust(24)
+                    p_str = f"({anc.pos[0]:+5.2f}, {anc.pos[1]:+5.2f}, {anc.pos[2]:+5.2f})"
+                    print(f"  [ANCHOR #{anc.node_id:02d}] {anc.bind_ip}:{anc.port:<5d}  {dname}  Coord={p_str}")
+
+            elif op == "/role" and len(parts) >= 3:
+                try:
+                    nid = int(parts[1].lstrip("#"))
+                    role_str = parts[2].lower()
+                    target = next((n for n in swarm.nodes if n.node_id == nid), None)
+                    if target is None:
+                        print(f"  Node #{nid} not found.")
+                    else:
+                        new_fixed = role_str.startswith("fix")
+                        target.set_role(new_fixed)
+                        state_lbl = "FIXED REFERENCE ANCHOR" if new_fixed else "MOBILE TRILATERATING NODE"
+                        print(
+                            f"  Updated Node #{nid:02d} -> {state_lbl} at "
+                            f"({target.pos[0]:+.2f}, {target.pos[1]:+.2f}, {target.pos[2]:+.2f})"
+                        )
+                except ValueError:
+                    print("  Usage: /role <node_id> <fixed|mobile>")
+
+            elif op == "/ping":
+                t0 = time.perf_counter()
+                await swarm.run_ping_pong_trilateration_And_gossip(epochs=25)
+                dt = (time.perf_counter() - t0) * 1000.0
+                own_d, oth_d, ratio, m_err = swarm.compute_trilateration_metrics()
+                print(
+                    f"  Completed live PING/PONG sweep in {dt:.1f}ms | "
+                    f"Mobile Own-Anchor Dist={own_d:.3f} | Mobile VivErr={m_err:.3f}"
+                )
+
             elif op == "/peers":
-                print("  Node  UDP Port          Domain                 3D Vivaldi Coord (x, y, z)   VivErr  MeanRTT  Synapses")
-                print("  " + "-" * 96)
+                print(
+                    "  Node  Role     UDP Endpoint          Domain               3D Coordinate (x, y, z)    VivErr  MeanRTT  Anchors"
+                )
+                print("  " + "-" * 104)
                 step_stride = max(1, len(swarm.nodes) // 16)
                 for node in swarm.nodes[::step_stride]:
-                    dname = DOMAIN_NAMES[node.domain_id][:20].ljust(20)
+                    role_tag = "FIXED " if node.is_fixed else "MOBILE"
+                    dname = DOMAIN_NAMES[node.domain_id][:18].ljust(18)
                     p_str = f"({node.pos[0]:+5.2f}, {node.pos[1]:+5.2f}, {node.pos[2]:+5.2f})"
-                    syn_cnt = len(node.ternary_expert.weights)
                     m_rtt = node.mean_peer_rtt()
+                    anc_cnt = node.anchor_peer_count()
+                    ep_str = f"{node.bind_ip}:{node.port:<5d}".ljust(20)
                     print(
-                        f"  #{node.node_id:02d}   127.0.0.1:{node.port:<5d}   {dname}   {p_str}   "
-                        f"{node.vivaldi_err:5.3f}   {m_rtt:5.2f}ms   {syn_cnt:4d}x64t"
+                        f"  #{node.node_id:02d}   {role_tag}   {ep_str}  {dname}   {p_str}   "
+                        f"{node.vivaldi_err:5.3f}   {m_rtt:5.2f}ms    {anc_cnt:2d}"
                     )
 
             elif op == "/cluster" and len(parts) >= 2:
@@ -1531,8 +1872,11 @@ async def interactive_repl(
                     centroids = swarm.get_domain_centroids()
                     active_pos = centroids[dom_id]
                     swarm.last_trajectory = [active_pos]
-                    active_label = f"Near {DOMAIN_NAMES[dom_id]}"
-                    print(f"  Snapped Query Origin -> {active_label} @ ({active_pos[0]:+.2f}, {active_pos[1]:+.2f}, {active_pos[2]:+.2f})")
+                    active_label = f"Fixed Anchor {DOMAIN_SYMBOLS[dom_id]} ({DOMAIN_NAMES[dom_id]})"
+                    print(
+                        f"  Snapped Query Origin -> {active_label} @ "
+                        f"({active_pos[0]:+.2f}, {active_pos[1]:+.2f}, {active_pos[2]:+.2f})"
+                    )
                 else:
                     print("  Usage: /cluster <p|d|m|c> (Physics, Distributed, ML, Control)")
 
@@ -1569,12 +1913,12 @@ async def interactive_repl(
             elif op == "/train":
                 ep = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 60
                 t0 = time.perf_counter()
-                await swarm.run_hebbian_self_organization(epochs=ep)
+                await swarm.run_ping_pong_trilateration_And_gossip(epochs=ep)
                 dt = (time.perf_counter() - t0) * 1000.0
-                intra, inter, ratio, m_err = swarm.compute_clustering_ratio()
+                own_d, oth_d, ratio, m_err = swarm.compute_trilateration_metrics()
                 print(
-                    f"  Ran {ep} Vivaldi+Hebbian UDP epochs in {dt:.1f}ms | "
-                    f"Intra={intra:.3f} Inter={inter:.3f} Ratio={ratio:.3f} MeanVivErr={m_err:.3f}"
+                    f"  Ran {ep} Ping/Pong Trilateration + Gossip epochs in {dt:.1f}ms | "
+                    f"OwnAnchor={own_d:.3f} OtherAnchor={oth_d:.3f} Ratio={ratio:.3f} MobileVivErr={m_err:.3f}"
                 )
 
             elif op == "/inject" and len(parts) >= 3:
@@ -1592,8 +1936,11 @@ async def interactive_repl(
                 target_path = " ".join(parts[1:])
                 cnt = await swarm.load_path_into_swarm(target_path)
                 if cnt > 0:
-                    print(f"  Semantically routed {cnt} clauses from '{target_path}' via 64-trit resonance. Running 40 Vivaldi epochs...")
-                    await swarm.run_hebbian_self_organization(epochs=40)
+                    print(
+                        f"  Semantically routed {cnt} clauses from '{target_path}' via 64-trit resonance. "
+                        f"Running 40 trilateration epochs..."
+                    )
+                    await swarm.run_ping_pong_trilateration_And_gossip(epochs=40)
                     print("  Done. Type /peers or /map to inspect updated Vivaldi coordinates.")
                 else:
                     print(f"  No readable text clauses found at '{target_path}'.")
@@ -1602,18 +1949,21 @@ async def interactive_repl(
                 seed_text = " ".join(parts[1:]) if len(parts) > 1 else "the system stabilizes through"
                 centroids = swarm.get_domain_centroids()
                 for dom_id, c_pos in centroids.items():
-                    c_str = f"({c_pos[0]:+5.2f}, {c_pos[1]:+5.2f}, {c_pos[2]:+.2f})"
-                    print(f"\n► Origin @ {c_str} [{DOMAIN_NAMES[dom_id]} | λ={spatial_lambda:.2f} | surf={surf_rate:.2f}]")
+                    c_str = f"({c_pos[0]:+5.2f}, {c_pos[1]:+5.2f}, {c_pos[2]:+5.2f})"
+                    print(f"\n► Origin @ {c_str} [Fixed Anchor {DOMAIN_SYMBOLS[dom_id]}: {DOMAIN_NAMES[dom_id]} | λ={spatial_lambda:.2f}]")
                     await generate_sequence(
                         swarm, seed_text, c_pos, spatial_lambda, steps, surf_rate=surf_rate, verbose_trace=2
                     )
-                print(f"\n► Origin @ (+0.00, +0.00, +0.00) [Global Bridge | λ=0.14 | surf={surf_rate:.2f}]")
+                print(f"\n► Origin @ (+0.00, +0.00, +0.00) [Tetrahedral Center Bridge | λ=0.14 | surf={surf_rate:.2f}]")
                 await generate_sequence(
                     swarm, seed_text, (0.0, 0.0, 0.0), 0.14, steps, surf_rate=surf_rate, verbose_trace=2
                 )
 
             else:
-                print("  Unknown command. Type /cluster, /coord, /surf, /lambda, /sweep, /inject, /load, /train, /map, /peers, or /quit.")
+                print(
+                    "  Unknown command. Type /cluster, /coord, /surf, /lambda, /anchors, /role, /ping, /sweep, "
+                    "/inject, /load, /train, /map, /peers, or /quit."
+                )
             continue
 
         print(
@@ -1628,56 +1978,78 @@ async def interactive_repl(
 
 
 async def main() -> None:
-    parser = argparse.ArgumentParser(description="P2P Vivaldi-Coordinate LLM Swarm v4.0")
-    parser.add_argument("--nodes-per-domain", type=int, default=8, help="UDP peer nodes per specialist domain")
-    parser.add_argument("--epochs", type=int, default=140, help="Initial Vivaldi RTT + Synaptic Gossip UDP epochs")
+    parser = argparse.ArgumentParser(
+        description="P2P Vivaldi-Coordinate LLM Swarm v5.0 (Fixed Reference Anchors + Mobile Trilateration)"
+    )
+    parser.add_argument("--nodes-per-domain", type=int, default=8, help="Total UDP nodes per domain")
+    parser.add_argument("--fixed-per-domain", type=int, default=2, help="Fixed Reference Anchor nodes per domain")
+    parser.add_argument("--epochs", type=int, default=160, help="Initial Ping/Pong Trilateration + Gossip UDP epochs")
     parser.add_argument("--steps", type=int, default=10, help="Tokens to generate per prompt")
     parser.add_argument("--surf-rate", type=float, default=0.35, help="3D Query Origin surfing rate in [0.0, 1.0]")
+    parser.add_argument("--lan", action="store_true", help="Bind to 0.0.0.0 + enable UDP broadcast discovery across Wi-Fi/Hotspot")
+    parser.add_argument("--discovery-port", type=int, default=9999, help="UDP broadcast port for LAN peer discovery")
     parser.add_argument("--load-dir", type=str, default=None, help="Optional file or directory to ingest at boot")
     parser.add_argument("--prompt", type=str, default="the system stabilizes through", help="Initial benchmark prompt")
     parser.add_argument("--no-repl", action="store_true", help="Exit immediately after Stage 3 benchmark")
     args = parser.parse_args()
 
-    swarm = P2PSpatialSwarm(nodes_per_domain=args.nodes_per_domain, seed=42)
+    swarm = P2PSpatialSwarm(
+        nodes_per_domain=args.nodes_per_domain,
+        fixed_per_domain=args.fixed_per_domain,
+        seed=42,
+        lan_enable=args.lan,
+        discovery_port=args.discovery_port,
+    )
     await swarm.boot_swarm(custom_dir=args.load_dir)
 
     try:
-        print("=" * 78)
-        print(" P2P VIVALDI-COORDINATE LLM SWARM v4.0 (RTT SPRINGS + 64-TRIT GOSSIP)")
-        print("=" * 78)
-        print(f" Active UDP Peer Sockets : {len(swarm.nodes)} nodes + 1 Collector (port {swarm.collector.port})")
+        fixed_cnt = sum(1 for n in swarm.nodes if n.is_fixed)
+        mob_cnt = sum(1 for n in swarm.nodes if not n.is_fixed)
+        print("=" * 80)
+        print(" P2P VIVALDI-COORDINATE LLM SWARM v5.0 (FIXED ANCHORS + MOBILE TRILATERATION)")
+        print("=" * 80)
         print(
-            f" UDP Binary Packet Sizes : Header={HEADER_SIZE}B | Query={HEADER_SIZE+QUERY_SIZE}B | "
-            f"Proposal={HEADER_SIZE+PROPOSAL_SIZE}B | Gossip={HEADER_SIZE+REWARD_SIZE}B"
+            f" Active UDP Topology     : {fixed_cnt} Fixed Reference Anchors + {mob_cnt} Mobile Nodes "
+            f"(Bind IP: {swarm.bind_ip})"
+        )
+        print(
+            f" UDP Binary Packet Sizes : Header={HEADER_SIZE}B | Query={HEADER_SIZE+QUERY_SIZE}B (IPv4) | "
+            f"Ping/Pong={HEADER_SIZE+PING_PONG_SIZE}B"
         )
 
-        intra_0, inter_0, ratio_0, err_0 = swarm.compute_clustering_ratio()
-        print(f"\n[STAGE 1] Initial Random 3D Topology (Pre-Convergence)")
+        own_0, oth_0, ratio_0, err_0 = swarm.compute_trilateration_metrics()
+        print(f"\n[STAGE 1] Initial Unlocalized Mobile Nodes vs. Fixed Tetrahedral Reference Anchors")
         print(
-            f"  Intra-Dist : {intra_0:.3f} | Inter-Dist : {inter_0:.3f} | "
-            f"Ratio : {ratio_0:.3f} | Mean Vivaldi Err : {err_0:.3f}"
+            f"  Mobile-to-Own-Anchor Dist : {own_0:.3f} | Mobile-to-Other-Anchor Dist : {oth_0:.3f} | "
+            f"Ratio : {ratio_0:.3f} | Mobile VivErr : {err_0:.3f}"
         )
 
-        print(f"\n[STAGE 2] Running {args.epochs} Vivaldi RTT Spring + 64-Trit Synaptic Gossip UDP Epochs...")
+        print(f"\n[STAGE 2] Running {args.epochs} Two-Way PING/PONG Trilateration + 64-Trit Gossip Epochs...")
         t0 = time.perf_counter()
-        await swarm.run_hebbian_self_organization(epochs=args.epochs)
+        await swarm.run_ping_pong_trilateration_And_gossip(epochs=args.epochs)
         dt = (time.perf_counter() - t0) * 1000.0
-        intra_1, inter_1, ratio_1, err_1 = swarm.compute_clustering_ratio()
+        own_1, oth_1, ratio_1, err_1 = swarm.compute_trilateration_metrics()
         print(f"  Completed in {dt:.1f} ms")
         print(
-            f"  Intra-Dist : {intra_1:.3f} | Inter-Dist : {inter_1:.3f} | "
-            f"Ratio : {ratio_1:.3f} | Mean Vivaldi Err : {err_1:.3f}"
+            f"  Mobile-to-Own-Anchor Dist : {own_1:.3f} | Mobile-to-Other-Anchor Dist : {oth_1:.3f} | "
+            f"Ratio : {ratio_1:.3f} | Mobile VivErr : {err_1:.3f}"
         )
-        print(f"  Vivaldi Convergence : {(1.0 - ratio_1 / ratio_0) * 100:.1f}% tighter RTT+phase neighborhood clustering")
+        print(
+            f"  Anchor Trilateration Lock : {(1.0 - ratio_1 / ratio_0) * 100:.1f}% tighter mobile satellite "
+            f"convergence around Fixed Reference Anchors"
+        )
 
         centroids = swarm.get_domain_centroids()
-        print("\n" + "=" * 78)
-        print(f"[STAGE 3] VIVALDI-WEIGHTED 3D SURFING (Seed Prompt: \"{args.prompt}\")")
-        print("=" * 78)
+        print("\n" + "=" * 80)
+        print(f"[STAGE 3] 3D SURFING ACROSS FIXED REFERENCE ANCHORS (Seed Prompt: \"{args.prompt}\")")
+        print("=" * 80)
 
         for dom_id, centroid in centroids.items():
             c_str = f"({centroid[0]:+5.2f}, {centroid[1]:+5.2f}, {centroid[2]:+5.2f})"
-            print(f"\n► Start Origin @ {c_str}  [Near {DOMAIN_NAMES[dom_id]} Cluster | surf={args.surf_rate:.2f}]")
+            print(
+                f"\n► Start Origin @ {c_str}  [Fixed Anchor {DOMAIN_SYMBOLS[dom_id]}: "
+                f"{DOMAIN_NAMES[dom_id]} | surf={args.surf_rate:.2f}]"
+            )
             await generate_sequence(
                 swarm,
                 args.prompt,
@@ -1688,8 +2060,11 @@ async def main() -> None:
                 verbose_trace=3,
             )
 
-        print("\n" + "-" * 78)
-        print(f"► Start Origin @ (+0.00, +0.00, +0.00)  [Global Bridge / Low Spatial Decay λ=0.14 | surf={args.surf_rate:.2f}]")
+        print("\n" + "-" * 80)
+        print(
+            f"► Start Origin @ (+0.00, +0.00, +0.00)  [Tetrahedral Center Bridge / Low Decay λ=0.14 | "
+            f"surf={args.surf_rate:.2f}]"
+        )
         await generate_sequence(
             swarm,
             args.prompt,
@@ -1699,9 +2074,9 @@ async def main() -> None:
             surf_rate=args.surf_rate,
             verbose_trace=3,
         )
-        print("\n[STAGE 4] Unicode Braille 2D Projection of Last 3D Vivaldi Surfing Trajectory (o -> @):")
+        print("\n[STAGE 4] Unicode Braille 2D Projection ([P/D/M/C]=Fixed Anchors, [p/d/m/c]=Mobile Nodes):")
         print(swarm.render_terminal_topology(trajectory=swarm.last_trajectory))
-        print("=" * 78)
+        print("=" * 80)
 
         if not args.no_repl and sys.stdin.isatty():
             await interactive_repl(swarm, default_steps=args.steps, default_surf=args.surf_rate)
