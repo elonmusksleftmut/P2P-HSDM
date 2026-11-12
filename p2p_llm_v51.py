@@ -331,12 +331,12 @@ class ConfigurableTernaryEncoder:
         position-specific circular shifts + adjacent bigram interaction binding +
         learned `feature_gates`.
         """
-        window = [t.strip().lower() for t in context_tokens[-6:] if t.strip()]
+        window = [t.strip().lower() for t in context_tokens[-8:] if t.strip()]
         if not window:
             return tuple([0] * self.trit_dim)
 
         accum = [0.0] * self.trit_dim
-        shifts = (0, 7, 19, 37, 53, 79)
+        shifts = (0, 7, 19, 37, 53, 79, 97, 113)
 
         for dist_from_end, tok in enumerate(reversed(window)):
             # Sharp recency weighting + exact positional role shift
@@ -477,7 +477,7 @@ class ContrastiveTernaryAssociativeMemory:
         lr: float = 0.35,
     ) -> None:
         target = target_word.strip().lower()
-        ctx_clean = tuple(t.strip().lower() for t in context_tokens[-4:] if t.strip())
+        ctx_clean = tuple(t.strip().lower() for t in context_tokens[-8:] if t.strip())
         if not target or not ctx_clean:
             return
 
@@ -527,7 +527,7 @@ class ContrastiveTernaryAssociativeMemory:
             self._normalize_row(w_rival)
 
         # 3. Update multi-scale context prototypes with competitive decay on rivals
-        for k_len in range(1, min(4, len(ctx_clean)) + 1):
+        for k_len in range(1, min(8, len(ctx_clean)) + 1):
             sub_ctx = ctx_clean[-k_len:]
             proto_map = self.exact_context_prototypes[sub_ctx]
             # Softly decay competing targets in this exact context so new ground truth can win
@@ -575,7 +575,7 @@ class ContrastiveTernaryAssociativeMemory:
         if not self.synaptic_weights:
             return []
 
-        ctx_clean = tuple(t.strip().lower() for t in context_tokens[-4:] if t.strip())
+        ctx_clean = tuple(t.strip().lower() for t in context_tokens[-8:] if t.strip())
         if not ctx_clean:
             return []
 
@@ -594,7 +594,7 @@ class ContrastiveTernaryAssociativeMemory:
                 logits[word] += 1.8 * sdm_score
 
         # 2. Multi-scale Prototype Memory readout (hierarchical context suffixes)
-        for k_len in range(1, min(4, len(ctx_clean)) + 1):
+        for k_len in range(1, min(8, len(ctx_clean)) + 1):
             sub_ctx = ctx_clean[-k_len:]
             proto_map = self.exact_context_prototypes.get(sub_ctx)
             if proto_map:
@@ -612,9 +612,10 @@ class ContrastiveTernaryAssociativeMemory:
 
         ranked = sorted(logits.items(), key=lambda kv: kv[1], reverse=True)[: max(top_k * 2, 8)]
         max_l = ranked[0][1]
+        conf_gate = math.tanh(max(0.01, max_l) / 1.75)
         exps = [(w, math.exp(min(25.0, (l - max_l) / 0.45))) for w, l in ranked]
         total_z = sum(v for _, v in exps) or 1.0
-        return [(w, v / total_z) for w, v in exps[:top_k]]
+        return [(w, (v / total_z) * conf_gate) for w, v in exps[:top_k]]
 
 
 # ============================================================================
@@ -1185,7 +1186,7 @@ class P2PLLMNodeV51(asyncio.DatagramProtocol):
 
         transitions = 0
         for i in range(1, len(tokens)):
-            ctx = tokens[max(0, i - 4) : i]
+            ctx = tokens[max(0, i - 8) : i]
             target = tokens[i]
             self.memory.learn_transition(
                 ctx,
@@ -1281,7 +1282,10 @@ class P2PLLMNodeV51(asyncio.DatagramProtocol):
 
         # Pack the 70-byte QUERY_PULSE payload
         # Keep only the most recent tokens that fit cleanly inside the 24-byte wire tail
-        tail_tokens_list = [t.strip().lower() for t in context_tokens[-4:] if t.strip()]
+        tail_tokens_list = [
+            t.strip().lower() for t in context_tokens[-8:]
+            if t.strip() and t.strip().lower() not in (":", "<nl>", "<indent>", "<dedent>")
+        ]
         while len(tail_tokens_list) > 1 and len("|".join(tail_tokens_list).encode("utf-8")) > 24:
             tail_tokens_list.pop(0)
         tail_bytes = "|".join(tail_tokens_list).encode("utf-8")[:24].ljust(24, b"\x00")
@@ -1337,7 +1341,7 @@ class P2PLLMNodeV51(asyncio.DatagramProtocol):
         # Optional Epistemic-Tier-3 fast-weight reward broadcast
         if send_hebbian_reward and final_preds and self.transport:
             winner_word = final_preds[0][0]
-            reward_bytes = f"{'|'.join(context_tokens[-4:])}->{winner_word}".encode("utf-8")
+            reward_bytes = f"{'|'.join(context_tokens[-8:])}->{winner_word}".encode("utf-8")
             r_hdr = self._pack_header(
                 PKT_HEBBIAN_REWARD,
                 1,

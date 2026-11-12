@@ -15,6 +15,7 @@ Executes the 6 empirical experiments specified in the v5.0 code audit:
 """
 
 from __future__ import annotations
+import dataclasses
 
 import asyncio
 import collections
@@ -137,7 +138,6 @@ class BenchmarkMetrics:
     memory_kb: float
 
 
-import dataclasses
 
 
 async def evaluate_async_predictor(
@@ -344,7 +344,9 @@ async def run_experiment_1_single_vs_multinode(
             for doc in docs:
                 nodes[i].ingest_text(doc, preserve_structure=True)
 
-        await converge_vivaldi_manifolds(nodes, rounds=8)
+        await converge_vivaldi_manifolds(nodes, rounds=14)
+        await asyncio.sleep(0.08)
+        await asyncio.sleep(0.08)
 
         # 1A: Single Isolated Node (Node 0 only, fanout=0)
         m_single = await evaluate_async_predictor(
@@ -400,7 +402,9 @@ async def run_experiment_2_random_vs_learned_coords(
             for doc in docs:
                 nodes[i].ingest_text(doc, preserve_structure=True)
 
-        await converge_vivaldi_manifolds(nodes, rounds=10)
+        await converge_vivaldi_manifolds(nodes, rounds=14)
+        await asyncio.sleep(0.08)
+        await asyncio.sleep(0.08)
         mem_kb = estimate_node_memory_kb(nodes[0])
 
         m_rand_f1 = await evaluate_async_predictor(
@@ -695,11 +699,11 @@ async def run_experiment_6_peer_dropout_and_unlearning(
             if any(w == canary_target for w, _ in preds):
                 recalled_before += 1
 
-        # Now Node 5 broadcasts PKT_TOMBSTONE and disconnects (transports[5].close())
+        # Now Node 5 broadcasts PKT_TOMBSTONE, waits for socket flush, and disconnects
         tomb_hdr = nodes[5]._pack_header(PKT_TOMBSTONE, 1, 0, sig5, b"PURGE")
         for p in nodes[5].peers.values():
             nodes[5].transport.sendto(tomb_hdr + b"PURGE", (p.ip, p.port))  # type: ignore[union-attr]
-        await asyncio.sleep(0.025)
+        await asyncio.sleep(0.06)
         transports[5].close()
 
         # Simulate peer expiration sweep on surviving nodes 0..4
