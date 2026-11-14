@@ -36,6 +36,22 @@ A peer needs one address to join; it learns the rest by peer exchange.
 API (`/api/search?q=...`, `/api/status`) on 127.0.0.1 only - point an LLM tool
 or script at it to use the swarm as retrieval memory.
 
+## Give an AI model the swarm as memory
+
+`python -m hsdm mcp` is a Model Context Protocol server. An assistant that
+connects to it gets three tools: `swarm_search`, `swarm_status`, and - with
+`--notes` - `swarm_remember`, which saves a note the whole swarm can later
+find. For Claude Code:
+
+```
+claude mcp add hsdm --env HSDM_KEY='a long random phrase' -- \
+  python -m hsdm mcp --peer A.example:7700 --data ~/notes --notes ~/claude-notes
+```
+
+Any other MCP client takes the same command in its `mcpServers` config. The
+command must run where Python can import `hsdm`: from the repository folder,
+or with the repository on `PYTHONPATH`.
+
 Install `cryptography` to encrypt packets (ChaCha20-Poly1305). Without it
 they are authenticated but readable on the wire.
 
@@ -75,7 +91,8 @@ hsdm/wire.py     authenticated / encrypted datagrams
 hsdm/vivaldi.py  latency coordinates
 hsdm/node.py     the peer: membership, routing, fusion
 hsdm/web.py      local search page and JSON API
-hsdm/cli.py      serve / ask / demo / bench
+hsdm/mcp.py      MCP server for AI models
+hsdm/cli.py      serve / ask / mcp / demo / bench
 tests/           python -m pytest
 ```
 
