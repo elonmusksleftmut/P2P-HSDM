@@ -257,3 +257,26 @@ def test_mcp_search_and_remember(tmp_path):
         _stop(me, client, *nodes)
 
     asyncio.run(run())
+
+
+def test_build_reports_progress_and_node_reports_activity():
+    enc = Encoder(KEY)
+    ix = LocalIndex(enc)
+    for i in range(300):
+        ix.add_text("d", f"passage number {i} about topic {i % 7} with some filler words")
+    seen = []
+    ix.build(lambda done, total: seen.append((done, total)))
+    assert seen[-1] == (300, 300) and len(seen) == 2 and len(ix.vectors) == 300
+
+    async def run():
+        nodes, client = await _swarm()
+        log = []
+        nodes[2].on_event = log.append
+        await client.search("tcp retransmits segments", limit=1, fanout=3)
+        newcomer = Node(KEY, ping_interval=0.3)
+        await newcomer.start(bootstrap=[nodes[2].addr])
+        await asyncio.sleep(0.5)
+        assert any("answered a search" in m for m in log) and any("joined" in m for m in log)
+        _stop(newcomer, client, *nodes)
+
+    asyncio.run(run())

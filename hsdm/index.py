@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import re
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -129,11 +129,21 @@ class LocalIndex:
     def clear(self) -> None:
         self.passages = []
 
-    def build(self) -> None:
-        """(Re)encode every passage and refresh the advertised sketch."""
+    def build(self, progress: Optional[Callable[[int, int], None]] = None) -> None:
+        """(Re)encode every passage and refresh the advertised sketch.
+
+        progress(done, total) is called as encoding advances, so a caller can
+        show that a long build is alive.
+        """
         tokens = [tokenize(p.text) for p in self.passages]
         self.encoder.fit_idf(tokens)
-        self.vectors, _ = self.encoder.encode_many(tokens)
+        vectors = Trits.empty(self.encoder.dim)
+        for start in range(0, len(tokens), 250):
+            batch, _ = self.encoder.encode_many(tokens[start : start + 250])
+            vectors = vectors.concat(batch)
+            if progress:
+                progress(min(start + 250, len(tokens)), len(tokens))
+        self.vectors = vectors
         counts = np.zeros(SKETCH_BUCKETS, dtype=np.int64)
         df: dict = {}
         for toks in tokens:

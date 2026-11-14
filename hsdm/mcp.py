@@ -85,15 +85,20 @@ class Server:
             os.makedirs(self.notes, exist_ok=True)
             if self.notes not in self.folders:
                 self.folders.append(self.notes)
+        self.indexing = False
 
     async def reindex(self) -> int:
-        fresh = LocalIndex(self.node.encoder)
-        for folder in self.folders:
-            fresh.add_folder(folder)
-        fresh.version = self.node.index.version
-        await asyncio.to_thread(fresh.build)
-        self.node.index = fresh
-        return len(fresh)
+        self.indexing = True
+        try:
+            fresh = LocalIndex(self.node.encoder)
+            for folder in self.folders:
+                fresh.add_folder(folder)
+            fresh.version = self.node.index.version
+            await asyncio.to_thread(fresh.build)
+            self.node.index = fresh
+            return len(fresh)
+        finally:
+            self.indexing = False
 
     # -- tools ---------------------------------------------------------------
     async def _search(self, args: dict) -> str:
@@ -105,6 +110,8 @@ class Server:
         out = await run_search(self.node, query, limit, fanout)
         head = (f"{len(out['results'])} passages; asked {len(out['asked'])} of {out['known_peers']} peers, "
                 f"{len(out['answered'])} answered, {out['elapsed_ms']:.0f} ms.")
+        if self.indexing:
+            head += " This machine is still indexing its own files, so its passages may be missing; search again shortly."
         if not out["results"]:
             return head + " Nothing matched - try other words, or a higher fanout."
         parts = [head]
