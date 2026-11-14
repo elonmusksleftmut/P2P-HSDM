@@ -31,7 +31,10 @@ python -m hsdm serve ~/papers --port 7700 --peer A.example:7700
 python -m hsdm ask "how do we rotate the signing keys" --peer A.example:7700
 ```
 
-A peer needs one address to join; it learns the rest by peer exchange.
+A peer needs one address to join; it learns the rest by peer exchange. Peers
+on the same device need no address at all: each one checks local ports 7700
+and 7701 at start-up. `serve` prints a line whenever a peer joins or a search
+is answered, so you can see it working.
 `serve` re-indexes when files change. `--http` serves a search page and a JSON
 API (`/api/search?q=...`, `/api/status`) on 127.0.0.1 only - point an LLM tool
 or script at it to use the swarm as retrieval memory.

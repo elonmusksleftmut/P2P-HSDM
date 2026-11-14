@@ -11,7 +11,7 @@ import socket
 import struct
 import time
 from collections import Counter
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import wire
 import numpy as np
@@ -31,6 +31,10 @@ HIT_HEAD = struct.Struct("!12sBBf")
 
 MAX_HITS_PER_QUERY = 8
 PEX_PER_PONG = 8
+
+
+def _short(pid: int) -> str:
+    return f"{pid:016x}"[:8]
 
 
 @dataclasses.dataclass
@@ -100,6 +104,7 @@ class Node(asyncio.DatagramProtocol):
         self.peers: Dict[int, Peer] = {}
         self.ping_interval = ping_interval
         self.query_rate = 20.0  # queries per second accepted from any one peer
+        self.on_event: Optional[Callable[[str], None]] = None  # human-readable activity, for the console
         self.stats: Counter = Counter()
         self.addr: Addr = ("", 0)
         self._transport: Optional[asyncio.DatagramTransport] = None
@@ -108,6 +113,10 @@ class Node(asyncio.DatagramProtocol):
         self._queries: Dict[bytes, _Pending] = {}
         self._task: Optional[asyncio.Task] = None
         self._bootstrap: List[Addr] = []
+
+    def _emit(self, message: str) -> None:
+        if self.on_event:
+            self.on_event(message)
 
     # -- lifecycle -----------------------------------------------------------
     async def start(self, host: str = "127.0.0.1", port: int = 0, bootstrap: Sequence[Addr] = ()) -> None:
@@ -144,6 +153,7 @@ class Node(asyncio.DatagramProtocol):
             for pid, peer in list(self.peers.items()):
                 if now - peer.last_seen > 4 * self.ping_interval:
                     del self.peers[pid]
+                    self._emit(f"peer {_short(pid)} went quiet and was dropped")
             self._pings = {n: v for n, v in self._pings.items() if now - v[0] < 10}
             self._pinged = {a: t for a, t in self._pinged.items() if now - t < 10}
             targets = list(self.peers.values())
@@ -256,8 +266,13 @@ class Node(asyncio.DatagramProtocol):
             if len(self.peers) >= 4096:
                 return
             peer = self.peers[pkt.sender] = Peer(pkt.sender, addr, time.monotonic())
+            fresh = True
+        else:
+            fresh = False
         peer.addr = addr
         self._update(peer, state)
+        if fresh:
+            self._emit(f"peer {_short(pkt.sender)} joined from {addr[0]}:{addr[1]} with {peer.passages} passages")
         rtt = max(0.01, (time.monotonic() - sent[0]) * 1000.0)
         peer.rtt_ms = rtt if peer.rtt_ms is None else 0.8 * peer.rtt_ms + 0.2 * rtt
         self.coord.update(peer.rtt_ms, peer.pos, peer.height, peer.error)
@@ -301,6 +316,7 @@ class Node(asyncio.DatagramProtocol):
         query = Trits.from_bytes(pkt.body[QUERY_HEAD.size :], dim)
         hits = self.index.search(query, min(limit, MAX_HITS_PER_QUERY))
         self.stats["queries_served"] += 1
+        self._emit(f"answered a search from peer {_short(pkt.sender)}: sent {len(hits)} passages")
         if not hits:
             self._send(addr, wire.HIT, HIT_HEAD.pack(pkt.nonce, 0, 0, 0.0))
         for i, (score, passage) in enumerate(hits):

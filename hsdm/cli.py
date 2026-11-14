@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import os
 import sys
+import time
 from typing import List, Tuple
 
 from . import __version__
@@ -37,6 +38,23 @@ def _print(report) -> None:
             print(f"      {line[:110]}")
 
 
+LOCAL_PORTS = (7700, 7701)  # tried on this device at start-up, so local peers find each other unaided
+
+
+async def _start(node: Node, host: str, port: int, peers: List[str]) -> None:
+    """Bind (falling back to any free port) and join via the given peers plus this device's usual ports."""
+    bootstrap = [_addr(p) for p in peers] + [("127.0.0.1", p) for p in LOCAL_PORTS if p != port]
+    try:
+        await node.start(host, port, bootstrap)
+    except OSError:
+        await node.start(host, 0, [_addr(p) for p in peers] + [("127.0.0.1", p) for p in LOCAL_PORTS])
+
+
+def _progress(done: int, total: int) -> None:
+    if total > 500:
+        print(f"  indexing {done}/{total} passages", file=sys.stderr, flush=True)
+
+
 def _signature(folder: str) -> str:
     h = hashlib.blake2b(digest_size=16)
     for base, dirs, files in os.walk(folder):
@@ -53,13 +71,17 @@ def _signature(folder: str) -> str:
 async def _serve(args) -> None:
     node = Node(_key(args), dim=args.dim)
     count = node.index.add_folder(args.data)
-    node.index.build()
-    await node.start(args.host, args.port, [_addr(p) for p in args.peer])
-    print(f"hsdm {__version__}: serving {count} passages from {args.data} on udp://{node.addr[0]}:{node.addr[1]}"
+    print(f"hsdm {__version__}: reading {args.data} ({count} passages)...", flush=True)
+    node.index.build(_progress)
+    await _start(node, args.host, args.port, args.peer)
+    print(f"serving {count} passages on udp port {node.addr[1]}"
           f" ({'encrypted' if node.codec.seal else 'authenticated, not encrypted - install `cryptography`'})")
     if args.http:
         await serve_http(node, "127.0.0.1", args.http)
         print(f"search page: http://127.0.0.1:{args.http}/")
+    print("Running. This window stays busy on purpose - leave it open; Ctrl+C stops it.\n"
+          "Activity will show up below.", flush=True)
+    node.on_event = lambda msg: print(f"  {time.strftime('%H:%M:%S')}  {msg}", flush=True)
     seen = _signature(args.data)
     while True:
         await asyncio.sleep(args.rescan)
@@ -76,7 +98,7 @@ async def _serve(args) -> None:
 
 async def _ask(args) -> None:
     node = Node(_key(args), dim=args.dim, ping_interval=1.0)
-    await node.start("0.0.0.0", 0, [_addr(p) for p in args.peer])
+    await _start(node, "0.0.0.0", 0, args.peer)
     await asyncio.sleep(0.4)  # let peer exchange introduce the rest of the swarm
     if not await node.wait_for_peers(max(1, len(node.peers)), timeout=args.wait):
         if not node.peers:
@@ -90,10 +112,12 @@ async def _mcp(args) -> None:
 
     node = Node(_key(args), dim=args.dim)
     server = Server(node, args.data, args.notes)
-    count = await server.reindex() if server.folders else 0
-    await node.start(args.host, args.port, [_addr(p) for p in args.peer])
-    print(f"hsdm mcp: {count} local passages, udp://{node.addr[0]}:{node.addr[1]}", file=sys.stderr)
+    await _start(node, args.host, args.port, args.peer)
+    print(f"hsdm mcp: udp port {node.addr[1]}", file=sys.stderr)
+    indexing = asyncio.create_task(server.reindex()) if server.folders else None  # answer the client meanwhile
     await server.run_stdio()
+    if indexing:
+        indexing.cancel()
     node.stop()
 
 
@@ -170,7 +194,7 @@ def main(argv=None) -> None:
     m.add_argument("--data", action="append", default=[], metavar="DIR", help="folder to index and serve (repeatable)")
     m.add_argument("--notes", metavar="DIR", help="folder the assistant may write notes into; enables swarm_remember")
     m.add_argument("--host", default="0.0.0.0")
-    m.add_argument("--port", type=int, default=0)
+    m.add_argument("--port", type=int, default=7701)
 
     d = sub.add_parser("demo", help="run a local swarm over the Python docs and query it")
     d.add_argument("--nodes", type=int, default=8)
