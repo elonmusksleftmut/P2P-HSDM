@@ -1,4 +1,4 @@
-"""Command line: serve a folder to the swarm, ask the swarm, run a local demo."""
+"""Command line: serve a folder, ask the swarm, connect an AI model, run a demo."""
 
 from __future__ import annotations
 
@@ -85,6 +85,18 @@ async def _ask(args) -> None:
     node.stop()
 
 
+async def _mcp(args) -> None:
+    from .mcp import Server
+
+    node = Node(_key(args), dim=args.dim)
+    server = Server(node, args.data, args.notes)
+    count = await server.reindex() if server.folders else 0
+    await node.start(args.host, args.port, [_addr(p) for p in args.peer])
+    print(f"hsdm mcp: {count} local passages, udp://{node.addr[0]}:{node.addr[1]}", file=sys.stderr)
+    await server.run_stdio()
+    node.stop()
+
+
 async def _demo(args) -> None:
     from .bench import load_corpus
 
@@ -153,6 +165,13 @@ def main(argv=None) -> None:
     a.add_argument("--fanout", type=int, default=3, help="how many peers to ask")
     a.add_argument("--wait", type=float, default=3.0)
 
+    m = sub.add_parser("mcp", help="run as an MCP server so an AI model can search (and add to) the swarm")
+    common(m)
+    m.add_argument("--data", action="append", default=[], metavar="DIR", help="folder to index and serve (repeatable)")
+    m.add_argument("--notes", metavar="DIR", help="folder the assistant may write notes into; enables swarm_remember")
+    m.add_argument("--host", default="0.0.0.0")
+    m.add_argument("--port", type=int, default=0)
+
     d = sub.add_parser("demo", help="run a local swarm over the Python docs and query it")
     d.add_argument("--nodes", type=int, default=8)
     d.add_argument("--modules", type=int, default=120)
@@ -171,7 +190,7 @@ def main(argv=None) -> None:
     if rest:
         ap.error(f"unrecognised arguments: {' '.join(rest)}")
     try:
-        asyncio.run({"serve": _serve, "ask": _ask, "demo": _demo}[args.cmd](args))
+        asyncio.run({"serve": _serve, "ask": _ask, "demo": _demo, "mcp": _mcp}[args.cmd](args))
     except KeyboardInterrupt:
         pass
 

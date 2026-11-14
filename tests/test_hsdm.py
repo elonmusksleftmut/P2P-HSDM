@@ -215,3 +215,45 @@ def test_malformed_packets_do_not_crash_a_node():
         _stop(client, *nodes)
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------- MCP server
+def test_mcp_search_and_remember(tmp_path):
+    from hsdm.mcp import Server
+
+    async def run():
+        nodes, client = await _swarm()
+        me = Node(KEY, ping_interval=0.3)
+        server = Server(me, [], str(tmp_path / "notes"))
+        await me.start(bootstrap=[nodes[0].addr])
+        await asyncio.sleep(0.3)
+        await me.wait_for_peers(len(nodes), timeout=5)
+
+        async def call(name, args):
+            reply = await server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                         "params": {"name": name, "arguments": args}})
+            return reply["result"]
+
+        init = await server.handle({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "x"}})
+        assert init["result"]["protocolVersion"] == "x" and "tools" in init["result"]["capabilities"]
+        assert await server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
+        listed = await server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        assert {t["name"] for t in listed["result"]["tools"]} == {"swarm_search", "swarm_status", "swarm_remember"}
+
+        found = await call("swarm_search", {"query": "what is a neutron star", "limit": 1})
+        assert not found["isError"] and "astronomy" in found["content"][0]["text"]
+        assert (await call("swarm_search", {}))["isError"]
+
+        saved = await call("swarm_remember", {"title": "../../escape attempt", "text": "The wifi password hint is the name of the office cat."})
+        assert not saved["isError"]
+        written = list((tmp_path / "notes").iterdir())
+        assert len(written) == 1 and written[0].parent == tmp_path / "notes"
+
+        # another peer, in a "later conversation", can find the note through the swarm
+        await asyncio.sleep(0.8)
+        await client.wait_for_peers(len(nodes) + 1, timeout=5)
+        rep = await client.search("wifi password hint office cat", limit=1, fanout=1)
+        assert rep.results and "office cat" in rep.results[0].text and rep.results[0].peer == me.id
+        _stop(me, client, *nodes)
+
+    asyncio.run(run())
